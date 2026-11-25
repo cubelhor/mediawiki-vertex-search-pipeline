@@ -3,7 +3,15 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    SOURCE_GCP_PROJECT="prj-c9ec-ing-ds-dev-ec" \
+    WIKI_GCS_BUCKET="mediawiki-data-nov-25" \
+    WIKI_GCS_PREFIX="" \
+    BQ_LOCATION="EU" \
+    BQ_SOURCE_DATASET="wiki_raw_internal" \
+    BQ_AUTHORIZED_VIEW_DATASET="wiki_vertex_authorized" \
+    TARGET_VERTEX_PROJECT="prj-7efd-everydai-dev-4f9a" \
+    VERTEX_LOCATION="eu"
 
 # System CA certificates (Airbus internal root CA is mounted at runtime via Secret Manager -> MEDIAWIKI_CA_BUNDLE)
 RUN apt-get update \

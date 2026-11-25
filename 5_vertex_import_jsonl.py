@@ -427,15 +427,31 @@ def add_common_cloud_cli_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Upload both BigQuery (`*_bq.jsonl`) and Vertex GCS (`*-for-vertexai.jsonl`) files even when `--import-source bq`.",
     )
-    parser.add_argument("--source-project", default=DEFAULT_SOURCE_PROJECT)
-    parser.add_argument("--gcs-bucket", default=DEFAULT_GCS_BUCKET)
-    parser.add_argument("--gcs-prefix", default=DEFAULT_GCS_PREFIX)
-    parser.add_argument("--bq-location", default=DEFAULT_BQ_LOCATION)
-    parser.add_argument("--bq-source-dataset", default=DEFAULT_BQ_SOURCE_DATASET)
-    parser.add_argument("--bq-view-dataset", default=DEFAULT_BQ_VIEW_DATASET)
-    parser.add_argument("--vertex-project", default=DEFAULT_VERTEX_PROJECT)
+    parser.add_argument(
+        "--source-project",
+        default=DEFAULT_SOURCE_PROJECT,
+        help="GCP project hosting GCS bucket, BigQuery source tables, and Authorized Views (default: %(default)s).",
+    )
+    parser.add_argument("--gcs-bucket", default=DEFAULT_GCS_BUCKET, help="GCS bucket name (default: %(default)s).")
+    parser.add_argument("--gcs-prefix", default=DEFAULT_GCS_PREFIX, help="Optional GCS object prefix (default: '%(default)s').")
+    parser.add_argument("--bq-location", default=DEFAULT_BQ_LOCATION, help="BigQuery dataset location (default: %(default)s).")
+    parser.add_argument(
+        "--bq-source-dataset",
+        default=DEFAULT_BQ_SOURCE_DATASET,
+        help="Restricted BigQuery dataset in source-project for native tables (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--bq-view-dataset",
+        default=DEFAULT_BQ_VIEW_DATASET,
+        help="Authorized View & export dataset in source-project shared with Vertex AI Search (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--vertex-project",
+        default=DEFAULT_VERTEX_PROJECT,
+        help="Target GCP project hosting Vertex AI Search datastores (default: %(default)s).",
+    )
     parser.add_argument("--vertex-project-number", default=DEFAULT_VERTEX_PROJECT_NUMBER)
-    parser.add_argument("--vertex-location", default=DEFAULT_VERTEX_LOCATION)
+    parser.add_argument("--vertex-location", default=DEFAULT_VERTEX_LOCATION, help="Vertex AI Search location (default: %(default)s).")
     parser.add_argument("--raw-datastore-id", default=DEFAULT_RAW_DATASTORE_ID)
     parser.add_argument("--chunked-datastore-id", default=DEFAULT_CHUNKED_DATASTORE_ID)
 

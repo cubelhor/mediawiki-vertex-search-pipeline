@@ -44,13 +44,15 @@ DEFAULT_API_URL = os.environ.get("MEDIAWIKI_API_URL", "https://aow.eu.airbus.cor
 WIKI_BASE_ARTICLE_URL = os.environ.get("MEDIAWIKI_BASE_ARTICLE_URL", "https://aow.eu.airbus.corp/wiki/")
 REQUEST_TIMEOUT_SECONDS = 30
 
-DEFAULT_SOURCE_PROJECT = os.environ.get("SOURCE_GCP_PROJECT", "prj-c9ec-data-dom-dev-ec")
+# Ingestion, GCS, Cloud Run, BigQuery native tables, and Authorized Views project (`ing-dev`)
+DEFAULT_SOURCE_PROJECT = os.environ.get("SOURCE_GCP_PROJECT", "prj-c9ec-ing-ds-dev-ec")
 DEFAULT_GCS_BUCKET = os.environ.get("WIKI_GCS_BUCKET", "mediawiki-data-nov-25")
 DEFAULT_GCS_PREFIX = os.environ.get("WIKI_GCS_PREFIX", "")
 DEFAULT_BQ_LOCATION = os.environ.get("BQ_LOCATION", "EU")
 DEFAULT_BQ_SOURCE_DATASET = os.environ.get("BQ_SOURCE_DATASET", "wiki_raw_internal")
 DEFAULT_BQ_VIEW_DATASET = os.environ.get("BQ_AUTHORIZED_VIEW_DATASET", "wiki_vertex_authorized")
 
+# Cross-project Vertex AI Search consumer project (`everyday-dev`)
 DEFAULT_VERTEX_PROJECT = os.environ.get("TARGET_VERTEX_PROJECT", "prj-7efd-everydai-dev-4f9a")
 DEFAULT_VERTEX_PROJECT_NUMBER = os.environ.get("TARGET_VERTEX_PROJECT_NUMBER", "")
 DEFAULT_VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "eu")

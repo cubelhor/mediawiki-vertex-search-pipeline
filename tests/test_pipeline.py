@@ -17,6 +17,11 @@ if str(REPO) not in sys.path:
 
 import run_pipeline  # noqa: E402
 from wiki_utils import (  # noqa: E402
+    DEFAULT_BQ_SOURCE_DATASET,
+    DEFAULT_BQ_VIEW_DATASET,
+    DEFAULT_GCS_BUCKET,
+    DEFAULT_SOURCE_PROJECT,
+    DEFAULT_VERTEX_PROJECT,
     backfill_missing_revisions,
     build_page_title_index,
     create_mediawiki_session,
@@ -152,6 +157,19 @@ class MediaWikiPipelineTests(unittest.TestCase):
         self.assertEqual(wins[0].count("```"), 2)
 
     def test_orchestrator_recentchanges_and_empty_gcs_prefix(self) -> None:
+        self.assertEqual(DEFAULT_SOURCE_PROJECT, "prj-c9ec-ing-ds-dev-ec")
+        self.assertEqual(DEFAULT_GCS_BUCKET, "mediawiki-data-nov-25")
+        self.assertEqual(DEFAULT_BQ_SOURCE_DATASET, "wiki_raw_internal")
+        self.assertEqual(DEFAULT_BQ_VIEW_DATASET, "wiki_vertex_authorized")
+        self.assertEqual(DEFAULT_VERTEX_PROJECT, "prj-7efd-everydai-dev-4f9a")
+        parsed = run_pipeline.build_parser().parse_args(["--skip-crawl", "--dry-run"])
+        self.assertEqual(parsed.source_project, "prj-c9ec-ing-ds-dev-ec")
+        self.assertEqual(parsed.vertex_project, "prj-7efd-everydai-dev-4f9a")
+        view_sql = _step5.build_authorized_view_sql(
+            parsed.source_project, parsed.bq_source_dataset, "wiki_option1_raw_templates"
+        )
+        self.assertIn("`prj-c9ec-ing-ds-dev-ec.wiki_raw_internal.wiki_option1_raw_templates`", view_sql)
+
         specs = _step5.build_option_specs("", "raw-ds", "chunk-ds")
         self.assertEqual(specs[0].gcs_bq_blob, "option1_raw/raw_with_templates_bq.jsonl")
         self.assertEqual(specs[1].gcs_bq_blob, "option2_chunked/chunks_bq.jsonl")
