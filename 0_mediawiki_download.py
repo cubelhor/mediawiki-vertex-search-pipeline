@@ -1,25 +1,9 @@
-"""Download all pages across all active MediaWiki namespaces (with full wikitext, categories, and URLs).
-
-Hardened against real-world MediaWiki API & corporate network edge cases:
-1. Iterates across **all knowledge namespaces** by default (`0` Main, `4` Project, `12` Help,
-   `14` Category hubs, and all custom namespaces `100+` like `LGSIM:`, `LG Test:`, etc.).
-2. Uses `gaplimit=50` to match MediaWiki's 50-revision per-request cap for non-bot accounts,
-   and automatically backfills individual `pageids=<pid>` if any batch hits `$wgAPIMaxResultSize`.
-3. Preserves `active_gapcontinue` across `clcontinue`/`rvcontinue` sub-continuations so Window 2+
-   never resets back to the first page of a namespace when >500 categories exist in a batch.
-4. Handles HTTP-200 `maxlag`/`ratelimited` backoff (`Retry-After`), SSO HTML login redirect detection,
-   and `readapidenied` diagnostics via `mw_api_request`.
-5. Stages batches in `wikimedia-data/raw_api/.staging_download/` and atomically swaps into `raw_api/`
-   only after the full download completes—never wiping existing batches on a mid-run VPN/proxy drop.
-6. Supports Airbus internal PKI (`MEDIAWIKI_CA_BUNDLE` / OS `truststore`), `--bypass-proxy` for
-   internal `.corp` hosts, SSO cookies (`MEDIAWIKI_COOKIE` / `--cookie-file`), and BotPasswords.
-"""
+"""Download all pages across all active MediaWiki namespaces (with full wikitext, categories, and URLs)."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -27,20 +11,26 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 from wiki_utils import (
+    DEFAULT_API_URL,
+    REQUEST_TIMEOUT_SECONDS,
+    add_common_mediawiki_cli_args,
     backfill_missing_revisions,
+    commit_staged_files,
     create_mediawiki_session,
+    get_logger,
+    is_generator_advancing,
     is_revision_texthidden,
     maybe_login_mediawiki,
     merge_mediawiki_page_payload,
     mw_api_request,
+    reset_staging_dir,
     safe_child_path,
+    validate_https_url,
 )
 
+logger = get_logger("0_mediawiki_download")
 ROOT = Path(__file__).resolve().parent
-BASE_DIR = ROOT / "wikimedia-data"
-RAW_DIR = BASE_DIR / "raw_api"
-DEFAULT_API_URL = os.environ.get("MEDIAWIKI_API_URL", "https://aow.eu.airbus.corp/api.php")
-REQUEST_TIMEOUT_SECONDS = 30
+RAW_DIR = ROOT / "wikimedia-data" / "raw_api"
 
 # System / non-article even namespaces excluded by default (10=Template is fetched by 1_fetch_templates.py)
 DEFAULT_EXCLUDED_EVEN_NAMESPACES = {
@@ -50,12 +40,6 @@ DEFAULT_EXCLUDED_EVEN_NAMESPACES = {
     10,   # Template (handled separately by 1_fetch_templates.py)
     828,  # Scribunto Lua Module
 }
-
-
-def _validate_https_url(url: str) -> str:
-    if not url.lower().startswith("https://"):
-        raise ValueError(f"Refusing insecure non-HTTPS MediaWiki API URL: {url!r}")
-    return url
 
 
 def discover_all_knowledge_namespaces(
@@ -87,34 +71,13 @@ def discover_all_knowledge_namespaces(
     selected: List[Tuple[int, str]] = []
     for ns_info in ns_map.values():
         ns_id = int(ns_info.get("id", -1))
-        if ns_id < 0:  # Skip Special (-1) and Media (-2)
-            continue
-        if not include_talk and (ns_id % 2 == 1):  # Odd IDs in MediaWiki are Talk namespaces
-            continue
-        if ns_id in excluded:
+        if ns_id < 0 or (not include_talk and ns_id % 2 == 1) or ns_id in excluded:
             continue
         ns_name = str(ns_info.get("*") or ns_info.get("canonical") or "Main")
         selected.append((ns_id, ns_name))
 
     selected.sort(key=lambda item: item[0])
     return selected or [(0, "Main")]
-
-
-def merge_page_payload(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
-    """Merge multi-continuation MediaWiki `prop` payloads (`revisions`, `categories`, `fullurl`)."""
-    merge_mediawiki_page_payload(target, incoming)
-
-
-def _is_generator_advancing(continue_token: Dict[str, Any]) -> bool:
-    """Return True only when all sub-property continuations (`rvcontinue`, `clcontinue`) are finished."""
-    if "gapcontinue" not in continue_token:
-        return False
-    cont_str = str(continue_token.get("continue") or "")
-    # In MediaWiki's `<gen>|<list>|<prop>` token, leading `||` means generator is paused for sub-props
-    if cont_str.startswith("||"):
-        return False
-    sub_keys = {k for k in continue_token if k not in {"gapcontinue", "continue"}}
-    return len(sub_keys) == 0
 
 
 def fetch_wiki_batches(
@@ -133,25 +96,17 @@ def fetch_wiki_batches(
             f"gaplimit={gaplimit} exceeds MediaWiki's 50-revision per-request limit for non-bot accounts; use <= 50."
         )
 
-    base_url = _validate_https_url(api_url)
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    staging_dir = RAW_DIR / ".staging_download"
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    base_url = validate_https_url(api_url)
+    staging_dir = reset_staging_dir(RAW_DIR, ".staging_download")
 
     sess = session or create_mediawiki_session(bypass_proxy=bypass_proxy, cookie_file=cookie_file)
     maybe_login_mediawiki(sess, base_url, timeout=REQUEST_TIMEOUT_SECONDS)
 
     try:
-        if namespaces is None:
-            ns_list = discover_all_knowledge_namespaces(sess, base_url)
-        else:
-            ns_list = list(namespaces)
-
-        print(
-            "Discovered namespaces to download: "
-            + ", ".join(f"{ns_id}:{ns_name}" for ns_id, ns_name in ns_list)
+        ns_list = list(namespaces) if namespaces is not None else discover_all_knowledge_namespaces(sess, base_url)
+        logger.info(
+            "Discovered namespaces to download: %s",
+            ", ".join(f"{ns_id}:{ns_name}" for ns_id, ns_name in ns_list),
         )
 
         batch_num = 1
@@ -179,13 +134,12 @@ def fetch_wiki_batches(
             window_pages: Dict[str, Dict[str, Any]] = {}
             ns_count = 0
 
-            print(f"\nScanning namespace {ns_id} ({ns_name})...")
+            logger.info("Scanning namespace %d (%s)...", ns_id, ns_name)
 
             def flush_window() -> bool:
                 nonlocal batch_num, total_downloaded, ns_count, window_pages
                 if not window_pages:
                     return False
-                # Ignore negative page IDs (`missing` pages)
                 valid_pages = {
                     pid: p
                     for pid, p in window_pages.items()
@@ -195,8 +149,6 @@ def fetch_wiki_batches(
                     window_pages = {}
                     return False
 
-                # If any page in the 50-page window omitted revisions (e.g. >8MB `$wgAPIMaxResultSize` cap),
-                # automatically backfill each missing page ID individually before writing the batch!
                 initial_missing = sum(1 for p in valid_pages.values() if not p.get("revisions"))
                 if initial_missing > 0:
                     recovered = backfill_missing_revisions(
@@ -206,8 +158,11 @@ def fetch_wiki_batches(
                         timeout=REQUEST_TIMEOUT_SECONDS,
                         context=f"Backfill missing revisions (ns={ns_id}, batch={batch_num:04d})",
                     )
-                    print(
-                        f"  Backfilled {recovered}/{initial_missing} truncated page revision(s) in batch_{batch_num:04d}."
+                    logger.info(
+                        "Backfilled %d/%d truncated page revision(s) in batch_%04d.",
+                        recovered,
+                        initial_missing,
+                        batch_num,
                     )
 
                 page_count = len(valid_pages)
@@ -216,16 +171,18 @@ def fetch_wiki_batches(
                     for p in valid_pages.values()
                     if not p.get("revisions")
                     or (
-                        p.get("revisions")
-                        and not is_revision_texthidden(p["revisions"][0])
+                        not is_revision_texthidden(p["revisions"][0])
                         and "slots" not in p["revisions"][0]
                         and "*" not in p["revisions"][0]
                         and "content" not in p["revisions"][0]
                     )
                 )
                 if missing_revs > 0:
-                    print(
-                        f"  [WARNING] {missing_revs}/{page_count} pages in batch_{batch_num:04d} still lacked revision content!"
+                    logger.warning(
+                        "%d/%d pages in batch_%04d still lacked revision content!",
+                        missing_revs,
+                        page_count,
+                        batch_num,
                     )
 
                 payload = {
@@ -241,9 +198,14 @@ def fetch_wiki_batches(
                 )
                 total_downloaded += page_count
                 ns_count += page_count
-                print(
-                    f"  Staged {batch_file.name} (ns={ns_id}:{ns_name}, pages={page_count}, "
-                    f"missing_revisions={missing_revs}, total={total_downloaded})"
+                logger.info(
+                    "Staged %s (ns=%d:%s, pages=%d, missing_revisions=%d, total=%d)",
+                    batch_file.name,
+                    ns_id,
+                    ns_name,
+                    page_count,
+                    missing_revs,
+                    total_downloaded,
                 )
                 batch_num += 1
                 window_pages = {}
@@ -254,7 +216,7 @@ def fetch_wiki_batches(
                 req_sig = tuple(sorted(params.items()))
                 if req_sig in seen_request_signatures:
                     flush_window()
-                    print("  Detected repeated request state; advancing to next namespace.")
+                    logger.warning("Detected repeated request state; advancing to next namespace.")
                     break
                 seen_request_signatures.add(req_sig)
 
@@ -274,8 +236,10 @@ def fetch_wiki_batches(
                         for token in ("readapidenied", "permissiondenied", "http 403", "access denied", "not allowed")
                     )
                     if ns_id != 0 and is_acl_denial:
-                        print(
-                            f"  [SKIPPED] Namespace {ns_id} ({ns_name}) denied by MediaWiki ACL; continuing to next namespace."
+                        logger.warning(
+                            "[SKIPPED] Namespace %d (%s) denied by MediaWiki ACL; continuing.",
+                            ns_id,
+                            ns_name,
                         )
                         window_pages = {}
                         break
@@ -283,21 +247,21 @@ def fetch_wiki_batches(
 
                 pages = data.get("query", {}).get("pages", {})
                 if not pages and not window_pages:
-                    print(f"  Namespace {ns_id} ({ns_name}) is empty; skipping.")
+                    logger.info("Namespace %d (%s) is empty; skipping.", ns_id, ns_name)
                     break
 
                 for pid, pdata in pages.items():
                     if pid not in window_pages:
                         window_pages[pid] = dict(pdata)
                     else:
-                        merge_page_payload(window_pages[pid], pdata)
+                        merge_mediawiki_page_payload(window_pages[pid], pdata)
 
                 continue_token = data.get("continue")
                 if not continue_token:
                     reached_global_target = flush_window()
                     break
 
-                if _is_generator_advancing(continue_token):
+                if is_generator_advancing(continue_token):
                     reached_global_target = flush_window()
                     if reached_global_target:
                         break
@@ -307,8 +271,6 @@ def fetch_wiki_batches(
                     if "continue" in continue_token:
                         params["continue"] = str(continue_token["continue"])
                 else:
-                    # Sub-property continuation (`clcontinue` / `rvcontinue`) on the SAME 50-page window:
-                    # CRITICAL: preserve `active_gapcontinue` so Window 2+ never resets back to page 1!
                     params = dict(base_params)
                     if active_gapcontinue is not None:
                         params["gapcontinue"] = active_gapcontinue
@@ -316,29 +278,14 @@ def fetch_wiki_batches(
 
             per_ns_counts[f"{ns_id}:{ns_name}"] = ns_count
             if reached_global_target:
-                print(f"Reached target page count {target_pages}; stopping.")
+                logger.info("Reached target page count %d; stopping.", target_pages)
                 break
 
-        # Atomic swap: only replace RAW_DIR/batch_*.json once the full run succeeded!
-        staged_files = sorted(staging_dir.glob("batch_*.json"))
-        if not staged_files:
-            raise RuntimeError("No pages were downloaded across any namespace; leaving existing raw_api/ intact.")
-
-        if clean_existing_batches:
-            for old_batch in RAW_DIR.glob("batch_*.json"):
-                old_batch.unlink()
-
-        for staged_file in staged_files:
-            dest = safe_child_path(RAW_DIR, staged_file.name)
-            shutil.move(str(staged_file), str(dest))
-
-        shutil.rmtree(staging_dir, ignore_errors=True)
-
-        print("\nDownload complete and atomically committed to wikimedia-data/raw_api/!")
+        commit_staged_files(staging_dir, RAW_DIR, "batch_*.json", clean_existing=clean_existing_batches)
+        logger.info("Download complete and atomically committed to %s (total=%d pages).", RAW_DIR, total_downloaded)
         for ns_label, cnt in per_ns_counts.items():
             if cnt > 0:
-                print(f"  Namespace {ns_label}: {cnt} pages")
-        print(f"Total pages captured: {total_downloaded}")
+                logger.info("  Namespace %s: %d pages", ns_label, cnt)
         return total_downloaded
 
     except Exception:
@@ -352,36 +299,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--target-pages", type=int, default=None, help="Optional max pages to download.")
     parser.add_argument("--gaplimit", type=int, default=50, help="Pages per batch (max 50 for full revisions).")
-    parser.add_argument(
-        "--main-only",
-        action="store_true",
-        help="Only download Namespace 0 (Main) instead of iterating all namespaces.",
-    )
+    parser.add_argument("--main-only", action="store_true", help="Only download Namespace 0 (Main).")
     parser.add_argument("--include-talk", action="store_true", help="Also include Talk discussion namespaces.")
     parser.add_argument("--include-user", action="store_true", help="Also include User (ns=2) pages.")
-    parser.add_argument(
-        "--bypass-proxy",
-        action="store_true",
-        help="Ignore HTTP_PROXY/HTTPS_PROXY environment variables for direct internal .airbus.corp access.",
-    )
-    parser.add_argument(
-        "--cookie-file",
-        default=None,
-        help="Optional Netscape cookies.txt file for corporate SSO authentication (or set MEDIAWIKI_COOKIE).",
-    )
-    parser.add_argument(
-        "--maxlag",
-        type=int,
-        default=15,
-        help="MediaWiki maxlag threshold in seconds (automatically retries with backoff if exceeded).",
-    )
+    add_common_mediawiki_cli_args(parser)
     args = parser.parse_args()
 
-    shared_session = create_mediawiki_session(
-        bypass_proxy=args.bypass_proxy,
-        cookie_file=args.cookie_file,
-    )
-    api_endpoint = _validate_https_url(DEFAULT_API_URL)
+    shared_session = create_mediawiki_session(bypass_proxy=args.bypass_proxy, cookie_file=args.cookie_file)
+    api_endpoint = validate_https_url(DEFAULT_API_URL)
 
     if args.main_only:
         ns_targets = [(0, "Main")]

@@ -1,56 +1,30 @@
-"""Upload Option 1 & Option 2 JSONLs to GCS, load BigQuery tables + Authorized Views, and import into Vertex AI Search.
-
-Supports your full cross-project enterprise workflow:
-  Local JSONL -> GCS Bucket (Project A)
-              -> Native BigQuery Table in `BQ_SOURCE_DATASET` (Project A)
-              -> Authorized View (and optional materialized export table) in `BQ_VIEW_DATASET` (Project A)
-              -> Vertex AI Search Datastore 1 (Raw+Templates) & Datastore 2 (Manual Chunks) in Project B
-
-Examples:
-  # Preview all GCS paths, BigQuery schemas/views, IAM bindings, and Vertex import requests without cloud calls:
-  python3 5_vertex_import_jsonl.py --dry-run
-
-  # Upload JSONLs to GCS and create BigQuery native tables + Authorized Views in Project A:
-  python3 5_vertex_import_jsonl.py --steps upload-gcs setup-bq
-
-  # Also trigger cross-project Vertex AI Search imports into Project B (for both Option 1 and Option 2):
-  python3 5_vertex_import_jsonl.py --steps upload-gcs setup-bq import-vertex --import-source bq
-"""
+"""Upload Option 1 & Option 2 JSONLs to GCS, load BigQuery tables + Authorized Views, and import into Vertex AI Search."""
 
 from __future__ import annotations
 
 import argparse
-import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence
 
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+from wiki_utils import (
+    DEFAULT_BQ_LOCATION,
+    DEFAULT_BQ_SOURCE_DATASET,
+    DEFAULT_BQ_VIEW_DATASET,
+    DEFAULT_CHUNKED_DATASTORE_ID,
+    DEFAULT_GCS_BUCKET,
+    DEFAULT_GCS_PREFIX,
+    DEFAULT_RAW_DATASTORE_ID,
+    DEFAULT_SOURCE_PROJECT,
+    DEFAULT_VERTEX_LOCATION,
+    DEFAULT_VERTEX_PROJECT,
+    DEFAULT_VERTEX_PROJECT_NUMBER,
+    get_logger,
+)
 
+logger = get_logger("5_vertex_import")
 ROOT = Path(__file__).resolve().parent
-
-# Source Data / Staging Project (Project A: GCS + BigQuery)
-DEFAULT_SOURCE_PROJECT = os.environ.get("SOURCE_GCP_PROJECT", "prj-7efd-everydai-dev-4f9a")
-DEFAULT_GCS_BUCKET = os.environ.get("WIKI_GCS_BUCKET", "gemini-enterprise-wiki-staging-20261013-7efd")
-DEFAULT_GCS_PREFIX = os.environ.get("WIKI_GCS_PREFIX", "wiki/vertex")
-DEFAULT_BQ_LOCATION = os.environ.get("BQ_LOCATION", "EU")
-DEFAULT_BQ_SOURCE_DATASET = os.environ.get("BQ_SOURCE_DATASET", "wiki_raw_internal")
-DEFAULT_BQ_VIEW_DATASET = os.environ.get("BQ_AUTHORIZED_VIEW_DATASET", "wiki_vertex_authorized")
-
-# Target Vertex AI Search / Gemini Enterprise Project (Project B)
-DEFAULT_VERTEX_PROJECT = os.environ.get("TARGET_VERTEX_PROJECT", DEFAULT_SOURCE_PROJECT)
-DEFAULT_VERTEX_PROJECT_NUMBER = os.environ.get("TARGET_VERTEX_PROJECT_NUMBER", "")
-DEFAULT_VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "eu")
-
-DEFAULT_RAW_DATASTORE_ID = os.environ.get("VERTEX_RAW_DATASTORE_ID", "gemini-enterprise-wiki-raw")
-DEFAULT_CHUNKED_DATASTORE_ID = os.environ.get("VERTEX_CHUNKED_DATASTORE_ID", "gemini-enterprise-wiki-chunked")
 
 _GCP_PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{4,29}$")
 _BQ_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
@@ -159,24 +133,9 @@ def build_authorized_view_sql(project_id: str, source_dataset: str, source_table
     tbl = validate_bq_identifier(source_table)
     return (
         f"SELECT\n"
-        f"  id,\n"
-        f"  doc_type,\n"
-        f"  ns,\n"
-        f"  title,\n"
-        f"  content,\n"
-        f"  page_id,\n"
-        f"  page_title,\n"
-        f"  section_title,\n"
-        f"  chunk_type,\n"
-        f"  categories,\n"
-        f"  referenced_templates,\n"
-        f"  aliases,\n"
-        f"  is_redirect,\n"
-        f"  redirect_target,\n"
-        f"  uri,\n"
-        f"  source_file,\n"
-        f"  token_count,\n"
-        f"  updated_at\n"
+        f"  id, doc_type, ns, title, content, page_id, page_title, section_title,\n"
+        f"  chunk_type, categories, referenced_templates, aliases, is_redirect,\n"
+        f"  redirect_target, uri, source_file, token_count, updated_at\n"
         f"FROM `{proj}.{ds}.{tbl}`\n"
         f"WHERE content IS NOT NULL AND LENGTH(TRIM(content)) > 0"
     )
@@ -186,21 +145,24 @@ def upload_option_files_to_gcs(
     source_project: str,
     bucket_name: str,
     specs: Sequence[PipelineOptionSpec],
+    import_source: str = "bq",
+    upload_all_variants: bool = False,
     dry_run: bool = False,
 ) -> None:
     proj = validate_gcp_project_id(source_project)
     bucket_clean = validate_gcs_bucket(bucket_name)
 
     for spec in specs:
-        for local_path, blob_name in [
-            (spec.local_bq_jsonl, spec.gcs_bq_blob),
-            (spec.local_gcs_doc_jsonl, spec.gcs_doc_blob),
-        ]:
+        targets = [(spec.local_bq_jsonl, spec.gcs_bq_blob)]
+        if import_source == "gcs" or upload_all_variants:
+            targets.append((spec.local_gcs_doc_jsonl, spec.gcs_doc_blob))
+
+        for local_path, blob_name in targets:
             if not local_path.exists():
                 raise FileNotFoundError(f"Missing local export file: {local_path}")
             gcs_uri = f"gs://{bucket_clean}/{blob_name}"
             if dry_run:
-                print(f"[DRY-RUN] Would upload {local_path} ({local_path.stat().st_size:,} bytes) -> {gcs_uri}")
+                logger.info("[DRY-RUN] Would upload %s (%d bytes) -> %s", local_path, local_path.stat().st_size, gcs_uri)
                 continue
 
             from google.cloud import storage
@@ -208,7 +170,7 @@ def upload_option_files_to_gcs(
             client = storage.Client(project=proj)
             blob = client.bucket(bucket_clean).blob(blob_name)
             blob.upload_from_filename(str(local_path), content_type="application/jsonl; charset=utf-8")
-            print(f"Uploaded {local_path.name} -> {gcs_uri}")
+            logger.info("Uploaded %s -> %s", local_path.name, gcs_uri)
 
 
 def setup_bigquery_tables_and_authorized_views(
@@ -234,29 +196,28 @@ def setup_bigquery_tables_and_authorized_views(
         view_sql = build_authorized_view_sql(proj, src_ds_name, src_tbl)
 
         if dry_run:
-            print(f"\n[DRY-RUN] BigQuery setup for {spec.label}:")
-            print(f"  1. Load native table `{proj}.{src_ds_name}.{src_tbl}` from {gcs_bq_uri}")
-            print(f"  2. Create & authorize view `{proj}.{view_ds_name}.{view_name}`:\n{view_sql}")
+            logger.info("[DRY-RUN] BigQuery setup for %s:", spec.label)
+            logger.info("  1. Load native table `%s.%s.%s` from %s", proj, src_ds_name, src_tbl, gcs_bq_uri)
+            logger.info("  2. Create & authorize view `%s.%s.%s`", proj, view_ds_name, view_name)
             if materialize_export_table:
-                print(
-                    f"  3. Materialize physical export table `{proj}.{view_ds_name}.{exp_tbl}` "
-                    f"(recommended fallback if Discovery Engine BigQuerySource rejects logical views)"
-                )
+                logger.info("  3. Materialize physical export table `%s.%s.%s`", proj, view_ds_name, exp_tbl)
             continue
 
+        from google.api_core.exceptions import NotFound
         from google.cloud import bigquery
 
         bq = bigquery.Client(project=proj, location=bq_location)
 
-        # 1. Ensure both datasets exist (check get_dataset first so least-privilege SAs without datasets.create succeed)
+        # 1. Ensure both datasets exist (only call create_dataset on HTTP 404 NotFound!)
         for ds_id in (src_ds_name, view_ds_name):
             ds_full = f"{proj}.{ds_id}"
             try:
                 bq.get_dataset(ds_full)
-            except Exception:
+            except NotFound:
                 ds_obj = bigquery.Dataset(ds_full)
                 ds_obj.location = bq_location
                 bq.create_dataset(ds_obj, exists_ok=True)
+                logger.info("Created BigQuery dataset `%s` (%s)", ds_full, bq_location)
 
         # 2. Load GCS JSONL into a NATIVE BigQuery table (NOT an External Table!)
         src_table_ref = f"{proj}.{src_ds_name}.{src_tbl}"
@@ -268,20 +229,20 @@ def setup_bigquery_tables_and_authorized_views(
         load_job = bq.load_table_from_uri(gcs_bq_uri, src_table_ref, job_config=load_config)
         load_job.result()
         loaded_table = bq.get_table(src_table_ref)
-        print(f"Loaded {loaded_table.num_rows} rows into native table `{src_table_ref}`")
+        logger.info("Loaded %d rows into native table `%s`", loaded_table.num_rows, src_table_ref)
 
-        # 3. Create or update the View in-place (avoids transient downtime & preserves Authorized View ACLs)
+        # 3. Create or update the View in-place (only call create_table on HTTP 404 NotFound!)
         view_ref_str = f"{proj}.{view_ds_name}.{view_name}"
         try:
             existing_view = bq.get_table(view_ref_str)
             existing_view.view_query = view_sql
             created_view = bq.update_table(existing_view, ["view_query"])
-            print(f"Updated view `{view_ref_str}` in place")
-        except Exception:
+            logger.info("Updated view `%s` in place", view_ref_str)
+        except NotFound:
             view_obj = bigquery.Table(view_ref_str)
             view_obj.view_query = view_sql
             created_view = bq.create_table(view_obj)
-            print(f"Created view `{view_ref_str}`")
+            logger.info("Created view `%s`", view_ref_str)
 
         # 4. Authorize the View against the restricted source dataset (only needed when datasets differ)
         if src_ds_name != view_ds_name:
@@ -296,9 +257,9 @@ def setup_bigquery_tables_and_authorized_views(
                 access_entries.append(auth_entry)
                 source_dataset.access_entries = access_entries
                 bq.update_dataset(source_dataset, ["access_entries"])
-                print(f"Authorized view `{view_ref_str}` on source dataset `{proj}.{src_ds_name}`")
+                logger.info("Authorized view `%s` on source dataset `%s.%s`", view_ref_str, proj, src_ds_name)
 
-        # 5. Optional materialized physical table in shared dataset (for Discovery Engine bulk extract compatibility)
+        # 5. Optional materialized physical table in shared dataset
         if materialize_export_table:
             exp_ref_str = f"{proj}.{view_ds_name}.{exp_tbl}"
             ctas_sql = (
@@ -306,7 +267,7 @@ def setup_bigquery_tables_and_authorized_views(
                 f"SELECT * FROM `{proj}.{view_ds_name}.{view_name}`"
             )
             bq.query(ctas_sql).result()
-            print(f"Materialized physical export table `{exp_ref_str}`")
+            logger.info("Materialized physical export table `%s`", exp_ref_str)
 
 
 def _get_discovery_client_options(location: str):
@@ -323,6 +284,7 @@ def ensure_datastore(
     datastore_id: str,
     display_name: str,
 ) -> str:
+    from google.api_core.exceptions import NotFound
     from google.cloud import discoveryengine_v1 as v1
 
     client = v1.DataStoreServiceClient(client_options=_get_discovery_client_options(vertex_location))
@@ -331,9 +293,9 @@ def ensure_datastore(
 
     try:
         client.get_data_store(name=datastore_name)
-        print(f"Datastore already exists: {datastore_name}")
+        logger.info("Datastore already exists: %s", datastore_name)
         return datastore_name
-    except Exception:
+    except NotFound:
         pass
 
     datastore = v1.DataStore(
@@ -348,7 +310,7 @@ def ensure_datastore(
     )
     operation = client.create_data_store(request=request)
     result = operation.result(timeout=600)
-    print(f"Created datastore: {result.name}")
+    logger.info("Created datastore: %s", result.name)
     return result.name
 
 
@@ -375,18 +337,22 @@ def import_into_vertex_datastores(
         gcs_doc_uri = f"gs://{bucket_clean}/{spec.gcs_doc_blob}"
 
         if dry_run:
-            print(f"\n[DRY-RUN] Vertex AI Search import for {spec.label}:")
-            print(
-                f"  Target datastore: projects/{dst_proj}/locations/{vertex_location}"
-                f"/collections/default_collection/dataStores/{spec.datastore_id}"
+            logger.info("[DRY-RUN] Vertex AI Search import for %s:", spec.label)
+            logger.info(
+                "  Target datastore: projects/%s/locations/%s/collections/default_collection/dataStores/%s",
+                dst_proj,
+                vertex_location,
+                spec.datastore_id,
             )
             if import_source == "bq":
-                print(
-                    f"  Source: BigQuerySource(project_id={src_proj!r}, dataset_id={view_ds_name!r}, "
-                    f"table_id={bq_target_obj!r}, data_schema='custom'), id_field='id', mode=FULL"
+                logger.info(
+                    "  Source: BigQuerySource(project_id=%r, dataset_id=%r, table_id=%r, data_schema='custom'), id_field='id', mode=FULL",
+                    src_proj,
+                    view_ds_name,
+                    bq_target_obj,
                 )
             else:
-                print(f"  Source: GcsSource(input_uris=[{gcs_doc_uri!r}], data_schema='document'), mode=FULL")
+                logger.info("  Source: GcsSource(input_uris=[%r], data_schema='document'), mode=FULL", gcs_doc_uri)
             continue
 
         from google.cloud import discoveryengine_v1 as v1
@@ -426,9 +392,9 @@ def import_into_vertex_datastores(
             )
 
         operation = doc_client.import_documents(request=req)
-        print(f"Started Vertex import operation for {spec.datastore_id}: {operation.operation.name}")
+        logger.info("Started Vertex import operation for %s: %s", spec.datastore_id, operation.operation.name)
         result = operation.result(timeout=1800)
-        print(f"Completed Vertex import for {spec.datastore_id}: {result}")
+        logger.info("Completed Vertex import for %s: %s", spec.datastore_id, result)
 
 
 def print_cross_project_iam_hint(
@@ -438,14 +404,108 @@ def print_cross_project_iam_hint(
 ) -> None:
     proj_num = target_vertex_project_number or "<TARGET_VERTEX_PROJECT_NUMBER>"
     sa = f"service-{proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com"
-    print("\nCross-Project IAM Checklist (for Project B reading from Project A BigQuery):")
-    print(f"  Discovery Engine Service Agent: {sa}")
-    print(f"  1. On dataset `{source_project}.{view_dataset_id}` -> grant `roles/bigquery.dataViewer`")
-    print(f"  2. On project `{source_project}` -> grant `roles/bigquery.jobUser`")
-    print(
-        "  (Note: If Discovery Engine bulk import rejects the logical Authorized View, re-run with "
-        "`--materialize-export-table` to populate physical export tables in the same shared dataset.)"
+    logger.info(
+        "Cross-Project IAM Checklist (Discovery Engine SA `%s`): "
+        "(1) `roles/bigquery.dataViewer` on `%s.%s`, (2) `roles/bigquery.jobUser` on `%s`.",
+        sa,
+        source_project,
+        view_dataset_id,
+        source_project,
     )
+
+
+def add_common_cloud_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Attach shared GCS / BigQuery / Vertex AI Search flags (used by both `5_vertex_import_jsonl.py` and `run_pipeline.py`)."""
+    parser.add_argument(
+        "--import-source",
+        choices=["bq", "gcs"],
+        default="bq",
+        help="Source for Vertex AI Search datastore import (`bq` or `gcs`).",
+    )
+    parser.add_argument(
+        "--upload-all-variants",
+        action="store_true",
+        help="Upload both BigQuery (`*_bq.jsonl`) and Vertex GCS (`*-for-vertexai.jsonl`) files even when `--import-source bq`.",
+    )
+    parser.add_argument("--source-project", default=DEFAULT_SOURCE_PROJECT)
+    parser.add_argument("--gcs-bucket", default=DEFAULT_GCS_BUCKET)
+    parser.add_argument("--gcs-prefix", default=DEFAULT_GCS_PREFIX)
+    parser.add_argument("--bq-location", default=DEFAULT_BQ_LOCATION)
+    parser.add_argument("--bq-source-dataset", default=DEFAULT_BQ_SOURCE_DATASET)
+    parser.add_argument("--bq-view-dataset", default=DEFAULT_BQ_VIEW_DATASET)
+    parser.add_argument("--vertex-project", default=DEFAULT_VERTEX_PROJECT)
+    parser.add_argument("--vertex-project-number", default=DEFAULT_VERTEX_PROJECT_NUMBER)
+    parser.add_argument("--vertex-location", default=DEFAULT_VERTEX_LOCATION)
+    parser.add_argument("--raw-datastore-id", default=DEFAULT_RAW_DATASTORE_ID)
+    parser.add_argument("--chunked-datastore-id", default=DEFAULT_CHUNKED_DATASTORE_ID)
+
+
+def run_cloud_deployment(
+    options: Sequence[str],
+    steps: Sequence[str],
+    source_project: str = DEFAULT_SOURCE_PROJECT,
+    gcs_bucket: str = DEFAULT_GCS_BUCKET,
+    gcs_prefix: str = DEFAULT_GCS_PREFIX,
+    bq_location: str = DEFAULT_BQ_LOCATION,
+    bq_source_dataset: str = DEFAULT_BQ_SOURCE_DATASET,
+    bq_view_dataset: str = DEFAULT_BQ_VIEW_DATASET,
+    vertex_project: str = DEFAULT_VERTEX_PROJECT,
+    vertex_project_number: str = DEFAULT_VERTEX_PROJECT_NUMBER,
+    vertex_location: str = DEFAULT_VERTEX_LOCATION,
+    raw_datastore_id: str = DEFAULT_RAW_DATASTORE_ID,
+    chunked_datastore_id: str = DEFAULT_CHUNKED_DATASTORE_ID,
+    import_source: str = "bq",
+    materialize_export_table: bool = False,
+    upload_all_variants: bool = False,
+    dry_run: bool = False,
+) -> None:
+    """Execute GCS upload, BigQuery native table + Authorized View setup, and/or Vertex AI Search imports."""
+    all_specs = build_option_specs(
+        gcs_prefix=gcs_prefix,
+        raw_datastore_id=raw_datastore_id,
+        chunked_datastore_id=chunked_datastore_id,
+    )
+    selected_specs = [s for s in all_specs if s.key in set(options)]
+
+    if "upload-gcs" in steps:
+        upload_option_files_to_gcs(
+            source_project=source_project,
+            bucket_name=gcs_bucket,
+            specs=selected_specs,
+            import_source=import_source,
+            upload_all_variants=upload_all_variants,
+            dry_run=dry_run,
+        )
+
+    if "setup-bq" in steps:
+        setup_bigquery_tables_and_authorized_views(
+            source_project=source_project,
+            bucket_name=gcs_bucket,
+            bq_location=bq_location,
+            source_dataset_id=bq_source_dataset,
+            view_dataset_id=bq_view_dataset,
+            specs=selected_specs,
+            materialize_export_table=materialize_export_table,
+            dry_run=dry_run,
+        )
+        print_cross_project_iam_hint(
+            source_project=source_project,
+            view_dataset_id=bq_view_dataset,
+            target_vertex_project_number=vertex_project_number,
+        )
+
+    if "import-vertex" in steps:
+        import_into_vertex_datastores(
+            source_project=source_project,
+            bucket_name=gcs_bucket,
+            view_dataset_id=bq_view_dataset,
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
+            specs=selected_specs,
+            import_source=import_source,
+            use_materialized_table=materialize_export_table,
+            dry_run=dry_run,
+        )
 
 
 def main() -> None:
@@ -467,74 +527,33 @@ def main() -> None:
         help="Pipeline stages to run.",
     )
     parser.add_argument(
-        "--import-source",
-        choices=["bq", "gcs"],
-        default="bq",
-        help="Source for Vertex AI Search datastore import (`bq` or `gcs`).",
-    )
-    parser.add_argument(
         "--materialize-export-table",
         action="store_true",
         help="Also materialize physical export tables in the shared BigQuery dataset and import from them.",
     )
-    parser.add_argument("--source-project", default=DEFAULT_SOURCE_PROJECT)
-    parser.add_argument("--gcs-bucket", default=DEFAULT_GCS_BUCKET)
-    parser.add_argument("--gcs-prefix", default=DEFAULT_GCS_PREFIX)
-    parser.add_argument("--bq-location", default=DEFAULT_BQ_LOCATION)
-    parser.add_argument("--bq-source-dataset", default=DEFAULT_BQ_SOURCE_DATASET)
-    parser.add_argument("--bq-view-dataset", default=DEFAULT_BQ_VIEW_DATASET)
-    parser.add_argument("--vertex-project", default=DEFAULT_VERTEX_PROJECT)
-    parser.add_argument("--vertex-project-number", default=DEFAULT_VERTEX_PROJECT_NUMBER)
-    parser.add_argument("--vertex-location", default=DEFAULT_VERTEX_LOCATION)
-    parser.add_argument("--raw-datastore-id", default=DEFAULT_RAW_DATASTORE_ID)
-    parser.add_argument("--chunked-datastore-id", default=DEFAULT_CHUNKED_DATASTORE_ID)
     parser.add_argument("--dry-run", action="store_true", help="Validate files and print planned operations only.")
+    add_common_cloud_cli_args(parser)
     args = parser.parse_args()
 
-    all_specs = build_option_specs(
+    run_cloud_deployment(
+        options=args.options,
+        steps=args.steps,
+        source_project=args.source_project,
+        gcs_bucket=args.gcs_bucket,
         gcs_prefix=args.gcs_prefix,
+        bq_location=args.bq_location,
+        bq_source_dataset=args.bq_source_dataset,
+        bq_view_dataset=args.bq_view_dataset,
+        vertex_project=args.vertex_project,
+        vertex_project_number=args.vertex_project_number,
+        vertex_location=args.vertex_location,
         raw_datastore_id=args.raw_datastore_id,
         chunked_datastore_id=args.chunked_datastore_id,
+        import_source=args.import_source,
+        materialize_export_table=args.materialize_export_table,
+        upload_all_variants=args.upload_all_variants,
+        dry_run=args.dry_run,
     )
-    selected_specs = [s for s in all_specs if s.key in set(args.options)]
-
-    if "upload-gcs" in args.steps:
-        upload_option_files_to_gcs(
-            source_project=args.source_project,
-            bucket_name=args.gcs_bucket,
-            specs=selected_specs,
-            dry_run=args.dry_run,
-        )
-
-    if "setup-bq" in args.steps:
-        setup_bigquery_tables_and_authorized_views(
-            source_project=args.source_project,
-            bucket_name=args.gcs_bucket,
-            bq_location=args.bq_location,
-            source_dataset_id=args.bq_source_dataset,
-            view_dataset_id=args.bq_view_dataset,
-            specs=selected_specs,
-            materialize_export_table=args.materialize_export_table,
-            dry_run=args.dry_run,
-        )
-        print_cross_project_iam_hint(
-            source_project=args.source_project,
-            view_dataset_id=args.bq_view_dataset,
-            target_vertex_project_number=args.vertex_project_number,
-        )
-
-    if "import-vertex" in args.steps:
-        import_into_vertex_datastores(
-            source_project=args.source_project,
-            bucket_name=args.gcs_bucket,
-            view_dataset_id=args.bq_view_dataset,
-            vertex_project=args.vertex_project,
-            vertex_location=args.vertex_location,
-            specs=selected_specs,
-            import_source=args.import_source,
-            use_materialized_table=args.materialize_export_table,
-            dry_run=args.dry_run,
-        )
 
 
 if __name__ == "__main__":

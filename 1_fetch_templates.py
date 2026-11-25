@@ -1,22 +1,9 @@
-"""Download all MediaWiki Template definitions (Namespace 10) safely into wikimedia-data/templates/.
-
-Hardened against raw API & Windows/macOS filesystem edge cases:
-1. Preserves `active_gapcontinue` across `clcontinue`/`rvcontinue` sub-continuations.
-2. Merges multi-continuation `categories` lists instead of overwriting them.
-3. Uses `mw_api_request` for HTTP-200 `maxlag`/`ratelimited` backoff, Airbus PKI `SSLError` guidance,
-   corporate SSO HTML redirect detection, and `MEDIAWIKI_COOKIE` / `--cookie-file` auth.
-4. Automatically backfills individual `pageids=<pid>` if any template in a 50-page batch omitted `revisions`
-   (preventing silent dropped templates).
-5. Prefixes saved template files with `{page_id}_{short_name}.json` inside an atomic staging folder
-   so case-only variants (`Template:Cite Web` vs `Template:Cite web`, `TOClimit` vs `Toclimit`) and
-   Windows reserved names (`CON`, `AUX`, `PRN`) never collide or wipe existing templates on failure.
-"""
+"""Download all MediaWiki Template definitions (Namespace 10) safely into wikimedia-data/templates/."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 from pathlib import Path
@@ -25,38 +12,30 @@ from typing import Any, Dict, Optional
 import requests
 
 from wiki_utils import (
+    DEFAULT_API_URL,
+    REQUEST_TIMEOUT_SECONDS,
+    add_common_mediawiki_cli_args,
     backfill_missing_revisions,
     canonical_wiki_uri,
     clean_category_name,
+    commit_staged_files,
     create_mediawiki_session,
     extract_explicit_categories,
     extract_revision_wikitext,
+    get_logger,
+    is_generator_advancing,
     maybe_login_mediawiki,
     merge_mediawiki_page_payload,
     merge_unique_strings,
     mw_api_request,
+    reset_staging_dir,
     safe_child_path,
+    validate_https_url,
 )
 
+logger = get_logger("1_fetch_templates")
 ROOT = Path(__file__).resolve().parent
-BASE_DIR = ROOT / "wikimedia-data"
-TEMPLATE_DIR = BASE_DIR / "templates"
-DEFAULT_API_URL = os.environ.get("MEDIAWIKI_API_URL", "https://aow.eu.airbus.corp/api.php")
-REQUEST_TIMEOUT_SECONDS = 30
-
-
-def _merge_template_payload(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
-    merge_mediawiki_page_payload(target, incoming)
-
-
-def _is_generator_advancing(continue_token: Dict[str, Any]) -> bool:
-    if "gapcontinue" not in continue_token:
-        return False
-    cont_str = str(continue_token.get("continue") or "")
-    if cont_str.startswith("||"):
-        return False
-    sub_keys = {k for k in continue_token if k not in {"gapcontinue", "continue"}}
-    return len(sub_keys) == 0
+TEMPLATE_DIR = ROOT / "wikimedia-data" / "templates"
 
 
 def fetch_all_templates(
@@ -67,14 +46,8 @@ def fetch_all_templates(
     clean_existing: bool = True,
     session: Optional[requests.Session] = None,
 ) -> int:
-    if not api_url.lower().startswith("https://"):
-        raise ValueError(f"Refusing insecure non-HTTPS MediaWiki API URL: {api_url!r}")
-
-    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
-    staging_dir = TEMPLATE_DIR / ".staging_templates"
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    base_url = validate_https_url(api_url)
+    staging_dir = reset_staging_dir(TEMPLATE_DIR, ".staging_templates")
 
     base_params: Dict[str, str] = {
         "action": "query",
@@ -96,8 +69,8 @@ def fetch_all_templates(
     seen_request_signatures = set()
 
     sess = session or create_mediawiki_session(bypass_proxy=bypass_proxy, cookie_file=cookie_file)
-    maybe_login_mediawiki(sess, api_url, timeout=REQUEST_TIMEOUT_SECONDS)
-    print(f"Fetching templates from Namespace 10 ({api_url})...")
+    maybe_login_mediawiki(sess, base_url, timeout=REQUEST_TIMEOUT_SECONDS)
+    logger.info("Fetching templates from Namespace 10 (%s)...", base_url)
 
     try:
         while True:
@@ -108,7 +81,7 @@ def fetch_all_templates(
 
             data = mw_api_request(
                 sess,
-                api_url,
+                base_url,
                 params=params,
                 method="GET",
                 timeout=REQUEST_TIMEOUT_SECONDS,
@@ -122,13 +95,13 @@ def fetch_all_templates(
                 if page_id not in templates_by_id:
                     templates_by_id[page_id] = dict(page_data)
                 else:
-                    _merge_template_payload(templates_by_id[page_id], page_data)
+                    merge_mediawiki_page_payload(templates_by_id[page_id], page_data)
 
             continue_token = data.get("continue")
             if not continue_token:
                 break
 
-            if _is_generator_advancing(continue_token):
+            if is_generator_advancing(continue_token):
                 active_gapcontinue = str(continue_token["gapcontinue"])
                 params = dict(base_params)
                 params["gapcontinue"] = active_gapcontinue
@@ -144,23 +117,22 @@ def fetch_all_templates(
         if missing_tpl_revs > 0:
             recovered = backfill_missing_revisions(
                 sess,
-                api_url,
+                base_url,
                 templates_by_id,
                 timeout=REQUEST_TIMEOUT_SECONDS,
                 context="Backfill missing template revisions (ns=10)",
             )
-            print(f"  Backfilled {recovered}/{missing_tpl_revs} truncated template revision(s).")
+            logger.info("Backfilled %d/%d truncated template revision(s).", recovered, missing_tpl_revs)
 
         saved = 0
         for page_id, page_data in sorted(templates_by_id.items(), key=lambda kv: int(kv[0])):
             title = str(page_data.get("title") or "")
             revisions = page_data.get("revisions") or []
             if not revisions:
-                print(f"  [WARNING] Template page_id={page_id} ({title!r}) had no revisions even after backfill; skipping.")
+                logger.warning("Template page_id=%s (%r) had no revisions after backfill; skipping.", page_id, title)
                 continue
             rev0 = revisions[0]
             content = extract_revision_wikitext(rev0)
-            # Strip leading `Template:` (or localized namespace prefix like `Modèle:`) safely
             short_name = re.sub(r"^[^:]+:\s*", "", title, count=1).strip() or title.strip()
 
             api_cats = [
@@ -170,7 +142,6 @@ def fetch_all_templates(
             ]
             merged_cats = merge_unique_strings(api_cats, extract_explicit_categories(content))
 
-            # Prefix with page_id so case-insensitive OSes (Windows/macOS) never overwrite collisions
             staged_path = safe_child_path(staging_dir, f"{page_id}_{short_name}.json")
             template_payload = {
                 "page_id": str(page_id),
@@ -186,19 +157,8 @@ def fetch_all_templates(
             )
             saved += 1
 
-        if saved == 0:
-            raise RuntimeError("0 templates returned by API; leaving existing templates/ intact.")
-
-        if clean_existing:
-            for old_json in TEMPLATE_DIR.glob("*.json"):
-                old_json.unlink()
-
-        for staged_file in sorted(staging_dir.glob("*.json")):
-            dest = safe_child_path(TEMPLATE_DIR, staged_file.name)
-            shutil.move(str(staged_file), str(dest))
-
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        print(f"Finished downloading and atomically committing {saved} templates.")
+        commit_staged_files(staging_dir, TEMPLATE_DIR, "*.json", clean_existing=clean_existing)
+        logger.info("Finished downloading and atomically committing %d templates.", saved)
         return saved
 
     except Exception:
@@ -208,22 +168,7 @@ def fetch_all_templates(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download all MediaWiki Namespace-10 templates.")
-    parser.add_argument(
-        "--bypass-proxy",
-        action="store_true",
-        help="Ignore HTTP_PROXY/HTTPS_PROXY environment variables for direct internal .airbus.corp access.",
-    )
-    parser.add_argument(
-        "--cookie-file",
-        default=None,
-        help="Optional Netscape cookies.txt file for corporate SSO authentication (or set MEDIAWIKI_COOKIE).",
-    )
-    parser.add_argument(
-        "--maxlag",
-        type=int,
-        default=15,
-        help="MediaWiki maxlag threshold in seconds (automatically retries with backoff if exceeded).",
-    )
+    add_common_mediawiki_cli_args(parser)
     args = parser.parse_args()
     fetch_all_templates(
         bypass_proxy=args.bypass_proxy,

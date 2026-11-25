@@ -1,21 +1,7 @@
 """Cloud Run Job & Local Orchestrator for the Airbus MediaWiki → GCS → BigQuery → Vertex AI Search Pipeline.
 
-Keeps all existing scripts (`0_` through `5_`) 100% standalone for local testing while adding a clean,
-container-ready entrypoint supporting both CLI flags and Cloud Run environment variables.
-
-Operating Modes:
-1. `--skip-crawl` (or `SKIP_CRAWL=true`) — Recommended BEFORE the OpenWiki firewall opens:
-   Skips MediaWiki crawling (`0_`, `1_`) and local JSONL generation (`1b_`–`4_`), and runs
-   `5_vertex_import_jsonl.py` directly against the already-uploaded JSONLs in GCS
-   (e.g., `gs://mediawiki-data-nov-25/option1_raw/` & `option2_chunked/`).
-2. Full Daily Sync (default once the OpenWiki firewall opens):
-   - Fast quiet-day check via MediaWiki `list=recentchanges` + `list=logevents` against
-     `gs://<bucket>/_state/last_sync.json` (exits 0 in ~2s if nothing changed, unless `--force-sync`).
-   - Runs `0_mediawiki_download.py` -> `1_fetch_templates.py` -> `1b_build_raw_with_templates_jsonl.py`
-     -> `2_clean_wikitext.py` -> `3_chunk_pages.py` -> `4_generate_vertex_jsonl.py`.
-   - Enforces a Drop-Guard (`>= 85%` of previous page count and `>= MIN_PAGE_FLOOR`) BEFORE any
-     GCS overwrite, BigQuery truncate, or Vertex AI Search `FULL` reconciliation!
-   - Runs `5_vertex_import_jsonl.py` and saves updated sync state to GCS on full success.
+Executes all stages in-process in Python (sharing loaded MediaWiki pages, templates, and chunks in memory
+to avoid duplicate disk I/O and child Python subprocess spawns) while keeping scripts `0_`–`5_` standalone.
 """
 
 from __future__ import annotations
@@ -23,40 +9,36 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
 from wiki_utils import (
+    DEFAULT_API_URL,
     create_mediawiki_session,
+    get_logger,
+    load_all_raw_pages,
+    load_all_template_records,
+    load_template_registry,
     maybe_login_mediawiki,
     mw_api_request,
 )
 
+# Import numbered pipeline stages cleanly in-process (zero subprocess spawns or CLI flag duplication)
+_step0 = importlib.import_module("0_mediawiki_download")
+_step1 = importlib.import_module("1_fetch_templates")
+_step1b = importlib.import_module("1b_build_raw_with_templates_jsonl")
+_step2 = importlib.import_module("2_clean_wikitext")
+_step3 = importlib.import_module("3_chunk_pages")
+_step4 = importlib.import_module("4_generate_vertex_jsonl")
+_step5 = importlib.import_module("5_vertex_import_jsonl")
+
+logger = get_logger("run_pipeline")
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "wikimedia-data"
 STATE_BLOB_PATH = "_state/last_sync.json"
-
-# Hardcoded allow-list of local pipeline scripts (never executed via shell=True)
-_ALLOWED_SCRIPTS = {
-    "0_mediawiki_download.py",
-    "1_fetch_templates.py",
-    "1b_build_raw_with_templates_jsonl.py",
-    "2_clean_wikitext.py",
-    "3_chunk_pages.py",
-    "4_generate_vertex_jsonl.py",
-    "5_vertex_import_jsonl.py",
-}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -71,19 +53,6 @@ def _env_list(name: str, default: List[str]) -> List[str]:
     if not raw:
         return list(default)
     return [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
-
-
-def _run_stage_script(script_name: str, extra_args: Optional[List[str]] = None) -> None:
-    """Execute an allow-listed local pipeline script safely without shell interpolation."""
-    if script_name not in _ALLOWED_SCRIPTS:
-        raise ValueError(f"Refusing to execute non-allowlisted script: {script_name!r}")
-    script_path = (ROOT / script_name).resolve()
-    if not script_path.is_relative_to(ROOT.resolve()) or not script_path.is_file():
-        raise FileNotFoundError(f"Pipeline script not found: {script_path}")
-
-    cmd = [sys.executable, str(script_path), *(extra_args or [])]
-    print(f"\n>>> Running {script_name} {' '.join(extra_args or [])}".rstrip())
-    subprocess.run(cmd, cwd=str(ROOT), check=True)
 
 
 def _sha256_file(path: Path) -> str:
@@ -106,13 +75,13 @@ def _load_sync_state(source_project: str, bucket_name: str, dry_run: bool = Fals
             return {}
         return json.loads(blob.download_as_text(encoding="utf-8"))
     except Exception as exc:
-        print(f"  [INFO] Could not read prior sync state gs://{bucket_name}/{STATE_BLOB_PATH} ({exc}); assuming first run.")
+        logger.info("Could not read prior sync state gs://%s/%s (%s); assuming first run.", bucket_name, STATE_BLOB_PATH, exc)
         return {}
 
 
 def _save_sync_state(source_project: str, bucket_name: str, state: Dict[str, Any], dry_run: bool = False) -> None:
     if dry_run:
-        print(f"[DRY-RUN] Would persist sync state to gs://{bucket_name}/{STATE_BLOB_PATH}: {json.dumps(state)}")
+        logger.info("[DRY-RUN] Would persist sync state to gs://%s/%s: %s", bucket_name, STATE_BLOB_PATH, json.dumps(state))
         return
     from google.cloud import storage
 
@@ -122,7 +91,7 @@ def _save_sync_state(source_project: str, bucket_name: str, state: Dict[str, Any
         json.dumps(state, ensure_ascii=False, indent=2),
         content_type="application/json; charset=utf-8",
     )
-    print(f"Saved sync state to gs://{bucket_name}/{STATE_BLOB_PATH}")
+    logger.info("Saved sync state to gs://%s/%s", bucket_name, STATE_BLOB_PATH)
 
 
 def has_mediawiki_changes_since(
@@ -234,9 +203,12 @@ def verify_drop_guard(
         "option1_sha256": _sha256_file(opt1_bq),
         "option2_sha256": _sha256_file(opt2_bq),
     }
-    print(
-        f"Drop-guard PASSED: pages={opt1_pages}, templates={opt1_templates}, "
-        f"option2_chunks={opt2_chunks} (unique_pages={len(opt2_pids)})"
+    logger.info(
+        "Drop-guard PASSED: pages=%d, templates=%d, option2_chunks=%d (unique_pages=%d)",
+        opt1_pages,
+        opt1_templates,
+        opt2_chunks,
+        len(opt2_pids),
     )
     return metrics
 
@@ -275,16 +247,13 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=["upload-gcs", "setup-bq", "import-vertex"],
         default=_env_list("CLOUD_STEPS", []),
-        help=(
-            "Override Step 5 cloud actions. Default: `setup-bq` when `--skip-crawl` is set "
-            "(add `import-vertex` when ready), or `upload-gcs setup-bq` in full crawl mode."
-        ),
+        help="Override Step 5 cloud actions.",
     )
     parser.add_argument(
         "--run-vertex-import",
         action="store_true",
         default=_env_bool("RUN_VERTEX_IMPORT", False),
-        help="Convenience flag to append `import-vertex` to the default Step 5 cloud steps.",
+        help="Append `import-vertex` to the default Step 5 cloud steps.",
     )
     parser.add_argument(
         "--materialize-export-table",
@@ -297,55 +266,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="materialize_export_table",
         action="store_false",
         help="Disable physical BigQuery export table materialization.",
-    )
-    parser.add_argument(
-        "--import-source",
-        choices=["bq", "gcs"],
-        default=os.environ.get("IMPORT_SOURCE", "bq"),
-    )
-    parser.add_argument(
-        "--source-project",
-        default=os.environ.get("SOURCE_GCP_PROJECT", "prj-c9ec-data-dom-dev-ec"),
-    )
-    parser.add_argument(
-        "--gcs-bucket",
-        default=os.environ.get("WIKI_GCS_BUCKET", "mediawiki-data-nov-25"),
-    )
-    parser.add_argument(
-        "--gcs-prefix",
-        default=os.environ.get("WIKI_GCS_PREFIX", ""),
-    )
-    parser.add_argument(
-        "--bq-location",
-        default=os.environ.get("BQ_LOCATION", "EU"),
-    )
-    parser.add_argument(
-        "--bq-source-dataset",
-        default=os.environ.get("BQ_SOURCE_DATASET", "wiki_raw_internal"),
-    )
-    parser.add_argument(
-        "--bq-view-dataset",
-        default=os.environ.get("BQ_AUTHORIZED_VIEW_DATASET", "wiki_vertex_authorized"),
-    )
-    parser.add_argument(
-        "--vertex-project",
-        default=os.environ.get("TARGET_VERTEX_PROJECT", "prj-7efd-everydai-dev-4f9a"),
-    )
-    parser.add_argument(
-        "--vertex-project-number",
-        default=os.environ.get("TARGET_VERTEX_PROJECT_NUMBER", ""),
-    )
-    parser.add_argument(
-        "--vertex-location",
-        default=os.environ.get("VERTEX_LOCATION", "eu"),
-    )
-    parser.add_argument(
-        "--raw-datastore-id",
-        default=os.environ.get("VERTEX_RAW_DATASTORE_ID", "gemini-enterprise-wiki-raw"),
-    )
-    parser.add_argument(
-        "--chunked-datastore-id",
-        default=os.environ.get("VERTEX_CHUNKED_DATASTORE_ID", "gemini-enterprise-wiki-chunked"),
     )
     parser.add_argument(
         "--bypass-proxy",
@@ -366,15 +286,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("MIN_PAGE_RATIO", "0.85")),
     )
+    _step5.add_common_cloud_cli_args(parser)
+    parser.set_defaults(import_source=os.environ.get("IMPORT_SOURCE", "bq"))
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     run_started_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    api_url = os.environ.get("MEDIAWIKI_API_URL", "https://aow.eu.airbus.corp/api.php")
+    api_url = DEFAULT_API_URL
 
-    # Resolve Step 5 cloud steps cleanly based on mode
     if args.cloud_steps:
         steps = list(args.cloud_steps)
     else:
@@ -385,21 +306,28 @@ def main() -> None:
     if args.skip_crawl and "upload-gcs" in steps:
         raise ValueError("`--skip-crawl` cannot be combined with `upload-gcs` (no local crawl files exist in container).")
 
-    print(
-        f"=== MediaWiki Cloud Run Pipeline Start ({run_started_utc}) ===\n"
-        f"  mode={'skip-crawl (GCS -> Cloud)' if args.skip_crawl else 'full-sync (MediaWiki -> GCS -> Cloud)'}\n"
-        f"  options={args.options}\n"
-        f"  cloud_steps={steps}\n"
-        f"  source_project={args.source_project}, gcs=gs://{args.gcs_bucket}/{args.gcs_prefix.strip('/')}\n"
-        f"  bq={args.bq_source_dataset} -> {args.bq_view_dataset} (materialize={args.materialize_export_table})\n"
-        f"  vertex_project={args.vertex_project} ({args.vertex_location}), dry_run={args.dry_run}"
+    logger.info(
+        "MediaWiki Pipeline Start (%s): mode=%s, options=%s, cloud_steps=%s, source_project=%s, gcs=gs://%s/%s, "
+        "bq=%s->%s (materialize=%s), vertex=%s (%s), dry_run=%s",
+        run_started_utc,
+        "skip-crawl" if args.skip_crawl else "full-sync",
+        args.options,
+        steps,
+        args.source_project,
+        args.gcs_bucket,
+        args.gcs_prefix.strip("/"),
+        args.bq_source_dataset,
+        args.bq_view_dataset,
+        args.materialize_export_table,
+        args.vertex_project,
+        args.vertex_location,
+        args.dry_run,
     )
 
     prev_state = _load_sync_state(args.source_project, args.gcs_bucket, dry_run=args.dry_run)
     crawl_metrics: Dict[str, Any] = {}
 
     if not args.skip_crawl:
-        # 1. Fast daily quiet-day check via MediaWiki recentchanges + logevents
         last_ts = prev_state.get("last_sync_timestamp")
         if last_ts and not args.force_sync:
             changed, reason = has_mediawiki_changes_since(
@@ -408,82 +336,79 @@ def main() -> None:
                 bypass_proxy=args.bypass_proxy,
                 cookie_file=args.cookie_file,
             )
-            print(f"Change check: {reason}")
+            logger.info("Change check: %s", reason)
             if not changed:
-                print("No source changes detected since last successful sync; skipping crawl/BQ/Vertex run.")
+                logger.info("No source changes detected since last successful sync; exiting cleanly.")
                 return
 
-        # 2. Crawl all accessible MediaWiki namespaces + Namespace-10 templates
-        crawl_flags: List[str] = []
-        if args.bypass_proxy:
-            crawl_flags.append("--bypass-proxy")
-        if args.cookie_file:
-            crawl_flags.extend(["--cookie-file", args.cookie_file])
+        # 1. Crawl all accessible MediaWiki namespaces + Namespace-10 templates sharing one session
+        shared_session = create_mediawiki_session(bypass_proxy=args.bypass_proxy, cookie_file=args.cookie_file)
+        maybe_login_mediawiki(shared_session, api_url, timeout=30)
+        _step0.fetch_wiki_batches(
+            api_url=api_url,
+            bypass_proxy=args.bypass_proxy,
+            cookie_file=args.cookie_file,
+            session=shared_session,
+        )
+        _step1.fetch_all_templates(
+            api_url=api_url,
+            bypass_proxy=args.bypass_proxy,
+            cookie_file=args.cookie_file,
+            session=shared_session,
+        )
 
-        _run_stage_script("0_mediawiki_download.py", crawl_flags)
-        _run_stage_script("1_fetch_templates.py", crawl_flags)
+        # 2. Load templates & raw pages ONCE in memory and build Option 1 & Option 2
+        need_gcs_doc = args.import_source == "gcs" or args.upload_all_variants
+        all_templates = load_all_template_records(DATA_DIR / "templates")
+        template_registry = load_template_registry(records=all_templates)
+        pages = load_all_raw_pages(DATA_DIR / "raw_api", template_registry=template_registry)
 
-        # 3. Build Option 1 & Option 2 JSONLs locally inside container tmpfs
-        _run_stage_script("1b_build_raw_with_templates_jsonl.py")
-        _run_stage_script("2_clean_wikitext.py")
-        _run_stage_script("3_chunk_pages.py")
-        _run_stage_script("4_generate_vertex_jsonl.py")
+        _step1b.build_option1_raw_datasets(
+            all_templates=all_templates,
+            template_registry=template_registry,
+            pages=pages,
+            write_gcs_doc_jsonl=need_gcs_doc,
+        )
+        _step2.process_raw_wikitext(template_registry=template_registry, pages=pages)
+        chunks = _step3.process_chunks()
+        _step4.generate_option2_jsonl(chunks=chunks, write_gcs_doc_jsonl=need_gcs_doc)
 
-        # 4. Drop-guard verification BEFORE any GCS overwrite / BigQuery truncate / Vertex FULL import
+        # 3. Drop-guard verification BEFORE any GCS overwrite / BigQuery truncate / Vertex FULL import
         crawl_metrics = verify_drop_guard(
             prev_state=prev_state,
             min_page_floor=args.min_page_floor,
             min_page_ratio=args.min_page_ratio,
         )
 
-        # Skip cloud writes if generated JSONL content hashes are byte-identical to last sync
         if (
             not args.force_sync
             and prev_state.get("option1_sha256") == crawl_metrics["option1_sha256"]
             and prev_state.get("option2_sha256") == crawl_metrics["option2_sha256"]
         ):
-            print("Generated Option 1 & Option 2 JSONLs are byte-identical to previous sync; skipping cloud import.")
+            logger.info("Generated Option 1 & Option 2 JSONLs are byte-identical to previous sync; skipping cloud import.")
             return
 
-    # 5. Run Step 5 (GCS upload / BigQuery native tables + Authorized Views / Vertex AI Search import)
-    step5_args: List[str] = [
-        "--options",
-        *args.options,
-        "--steps",
-        *steps,
-        "--import-source",
-        args.import_source,
-        "--source-project",
-        args.source_project,
-        "--gcs-bucket",
-        args.gcs_bucket,
-        "--gcs-prefix",
-        args.gcs_prefix,
-        "--bq-location",
-        args.bq_location,
-        "--bq-source-dataset",
-        args.bq_source_dataset,
-        "--bq-view-dataset",
-        args.bq_view_dataset,
-        "--vertex-project",
-        args.vertex_project,
-        "--vertex-location",
-        args.vertex_location,
-        "--raw-datastore-id",
-        args.raw_datastore_id,
-        "--chunked-datastore-id",
-        args.chunked_datastore_id,
-    ]
-    if args.vertex_project_number:
-        step5_args.extend(["--vertex-project-number", args.vertex_project_number])
-    if args.materialize_export_table:
-        step5_args.append("--materialize-export-table")
-    if args.dry_run:
-        step5_args.append("--dry-run")
+    # 4. Run Step 5 in-process
+    _step5.run_cloud_deployment(
+        options=args.options,
+        steps=steps,
+        source_project=args.source_project,
+        gcs_bucket=args.gcs_bucket,
+        gcs_prefix=args.gcs_prefix,
+        bq_location=args.bq_location,
+        bq_source_dataset=args.bq_source_dataset,
+        bq_view_dataset=args.bq_view_dataset,
+        vertex_project=args.vertex_project,
+        vertex_project_number=args.vertex_project_number,
+        vertex_location=args.vertex_location,
+        raw_datastore_id=args.raw_datastore_id,
+        chunked_datastore_id=args.chunked_datastore_id,
+        import_source=args.import_source,
+        materialize_export_table=args.materialize_export_table,
+        upload_all_variants=args.upload_all_variants,
+        dry_run=args.dry_run,
+    )
 
-    _run_stage_script("5_vertex_import_jsonl.py", step5_args)
-
-    # 6. Persist updated sync manifest only after a full crawl succeeded
     if not args.skip_crawl and crawl_metrics:
         new_state = {
             **crawl_metrics,
@@ -493,7 +418,7 @@ def main() -> None:
         }
         _save_sync_state(args.source_project, args.gcs_bucket, new_state, dry_run=args.dry_run)
 
-    print("\n=== MediaWiki Cloud Run Pipeline Completed Successfully ===")
+    logger.info("MediaWiki Pipeline Completed Successfully.")
 
 
 if __name__ == "__main__":

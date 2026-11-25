@@ -14,6 +14,7 @@ Key fixes over original `3_chunk_pages.py`:
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from pathlib import Path
@@ -21,12 +22,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from wiki_utils import (
     estimate_tokens,
+    get_logger,
     make_rfc1034_id,
     mw_canonical_title_key,
     normalize_title_key,
     safe_child_path,
 )
 
+logger = get_logger("3_chunk_pages")
 ROOT = Path(__file__).resolve().parent
 PAGES_DIR = ROOT / "wikimedia-data" / "processed" / "pages"
 CHUNKS_DIR = ROOT / "wikimedia-data" / "processed" / "chunks"
@@ -40,47 +43,36 @@ PURE_BOILERPLATE_SECTIONS = {
     "see also",
 }
 
+_OPERATIONAL_WORDS_RE = re.compile(
+    r"\b(?:run|build|compile|copy|check|update|execute|install|open|rename|generate|test|debug|create|load|follow|select|initialise|initialize|configure|set)\b",
+    re.IGNORECASE,
+)
+_REFERENCE_WORDS_RE = re.compile(
+    r"\b(?:part number|program|supplier|surface|aircraft|equipped|component specification|document|model|logic|version|fin)\b",
+    re.IGNORECASE,
+)
+_FRONTMATTER_RE = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n*(.*)$", re.DOTALL)
+_MD_HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*$")
+
 
 def classify_chunk(text: str) -> str:
-    operational_keywords = {
-        "run", "build", "compile", "copy", "check", "update", "execute", "install",
-        "open", "rename", "generate", "test", "debug", "create", "load", "follow",
-        "select", "initialise", "configure", "set",
-    }
-    reference_keywords = {
-        "part number", "program", "supplier", "surface", "aircraft", "equipped",
-        "component specification", "document", "model", "logic", "version", "fin",
-    }
-
-    lowered = text.lower()
-    if any(keyword in lowered for keyword in operational_keywords):
+    """Classify a chunk using whole-word boundaries (avoiding substring matches like `dataset` -> `set`)."""
+    if _OPERATIONAL_WORDS_RE.search(text):
         return "operational"
-    if any(keyword in lowered for keyword in reference_keywords):
+    if _REFERENCE_WORDS_RE.search(text):
         return "reference"
     return "conceptual"
 
 
 def parse_markdown_frontmatter(raw_md: str) -> Tuple[Dict[str, Any], str]:
-    """Extract `(metadata_dict, body_markdown)` without leaking frontmatter into body text."""
-    match = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n*(.*)$", raw_md, flags=re.DOTALL)
+    """Extract `(metadata_dict, body_markdown)` from JSON frontmatter."""
+    match = _FRONTMATTER_RE.match(raw_md)
     if not match:
         return {}, raw_md.strip()
 
     header_str, body = match.group(1).strip(), match.group(2).strip()
-    try:
-        meta = json.loads(header_str)
-        if isinstance(meta, dict):
-            return meta, body
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback simple key: value YAML parser for legacy files
-    meta = {}
-    for ln in header_str.splitlines():
-        if ":" in ln:
-            k, v = ln.split(":", 1)
-            meta[k.strip()] = v.strip()
-    return meta, body
+    meta = json.loads(header_str)
+    return (meta if isinstance(meta, dict) else {}), body
 
 
 def split_hierarchical_sections(markdown_text: str) -> List[Tuple[str, str]]:
@@ -108,7 +100,7 @@ def split_hierarchical_sections(markdown_text: str) -> List[Tuple[str, str]]:
             continue
 
         if not in_code_fence:
-            h_match = re.match(r"^(#{2,6})\s+(.+?)\s*$", line)
+            h_match = _MD_HEADING_RE.match(line)
             if h_match:
                 flush()
                 level = len(h_match.group(1))
@@ -468,9 +460,9 @@ def build_contextual_chunk_text(
     return header + "\n\n" + body_text.strip()
 
 
-def process_chunks(max_tokens: int = 400) -> List[Dict[str, Any]]:
+def process_chunks(max_tokens: int = 400, write_per_page_files: bool = False) -> List[Dict[str, Any]]:
     CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Clear old per-page chunk files so stale IDs don't linger
+    # Remove any old per-page chunk debug files so stale outputs never linger
     for old_chunk_file in CHUNKS_DIR.glob("*_chunks.json"):
         old_chunk_file.unlink()
 
@@ -617,17 +609,29 @@ def process_chunks(max_tokens: int = 400) -> List[Dict[str, Any]]:
                 page_chunks.append(chunk_record)
 
         if page_chunks:
-            page_file = safe_child_path(CHUNKS_DIR, f"{page_id}_{page_title}_chunks.json")
-            page_file.write_text(json.dumps(page_chunks, ensure_ascii=False, indent=2), encoding="utf-8")
+            if write_per_page_files:
+                page_file = safe_child_path(CHUNKS_DIR, f"{page_id}_{page_title}_chunks.json")
+                page_file.write_text(json.dumps(page_chunks, ensure_ascii=False, indent=2), encoding="utf-8")
             all_chunks.extend(page_chunks)
             stats["chunks_generated"] += len(page_chunks)
 
     CHUNKS_FILE.write_text(json.dumps(all_chunks, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Generated {stats['chunks_generated']} chunks successfully at {CHUNKS_FILE}")
-    for k, v in stats.items():
-        print(f"  {k}={v}")
+    logger.info(
+        "Generated %d chunks at %s (%s)",
+        stats["chunks_generated"],
+        CHUNKS_FILE,
+        ", ".join(f"{k}={v}" for k, v in stats.items()),
+    )
     return all_chunks
 
 
 if __name__ == "__main__":
-    process_chunks()
+    parser = argparse.ArgumentParser(description="Chunk cleaned MediaWiki Markdown pages.")
+    parser.add_argument("--max-tokens", type=int, default=400, help="Target max tokens per chunk (including header).")
+    parser.add_argument(
+        "--write-per-page",
+        action="store_true",
+        help="Also write individual `<page_id>_<title>_chunks.json` debug files.",
+    )
+    args = parser.parse_args()
+    process_chunks(max_tokens=args.max_tokens, write_per_page_files=args.write_per_page)

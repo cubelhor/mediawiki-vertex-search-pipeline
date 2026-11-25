@@ -15,10 +15,10 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
 WORKDIR /app
 
-COPY requirements-job.txt /app/
-RUN pip install --no-cache-dir -r /app/requirements-job.txt
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy only the pipeline scripts (wikimedia-data/ and secrets are strictly excluded by .dockerignore)
+# Copy only the pipeline scripts (wikimedia-data/, tests/, and secrets are excluded by .dockerignore)
 COPY wiki_utils.py \
      0_mediawiki_download.py \
      1_fetch_templates.py \

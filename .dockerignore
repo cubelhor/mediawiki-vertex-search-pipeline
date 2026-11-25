@@ -1,4 +1,4 @@
-# Never copy local corporate wiki data, git history, virtualenvs, or secrets into the Docker image!
+# Never copy local corporate wiki data, tests, git history, virtualenvs, or secrets into the Docker image!
 .git/
 .gitignore
 .DS_Store
@@ -7,10 +7,10 @@ __pycache__/
 .venv*/
 .clean_repo_export/
 wikimedia-data/
+tests/
 *cookies*.txt
 *.crt
 *.pem
 *.env
 *.zip
 README.md
-.requirements.txt

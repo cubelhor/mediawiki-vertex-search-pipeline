@@ -28,6 +28,7 @@ from wiki_utils import (
     RawPageRecord,
     TemplateRecord,
     build_page_title_index,
+    get_logger,
     load_all_raw_pages,
     load_template_registry,
     mwparserfromhell,
@@ -38,6 +39,7 @@ from wiki_utils import (
     strip_invisible_chars,
 )
 
+logger = get_logger("2_clean_wikitext")
 ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "wikimedia-data" / "raw_api"
 TEMPLATE_DIR = ROOT / "wikimedia-data" / "templates"
@@ -118,6 +120,23 @@ _OPAQUE_CODE_MATH_TAGS = {
 
 _IMAGE_OPTIONS_RE = re.compile(
     r"^(?:thumb|thumbnail|frameless|frame|framed|border|right|left|center|centre|none|baseline|middle|sub|super|text-top|text-bottom|top|bottom|upright(?:\s*=\s*[0-9.]+)?|\d*x?\d+\s*px|alt\s*=.*|link\s*=.*|page\s*=.*|class\s*=.*)$",
+    re.IGNORECASE,
+)
+_CELL_ATTR_RE = re.compile(
+    r"\b(?:style|class|width|height|align|valign|colspan|rowspan|bgcolor|scope|border)\s*=",
+    re.IGNORECASE,
+)
+_HEADING_EQ_RE = re.compile(r"^(=+)\s*(.*?)\s*\1\s*$")
+_NUM_LIST_GUARD_RE = re.compile(r"^#+\s*(?!redirect\b)\S", re.IGNORECASE)
+_NUM_LIST_SPLIT_RE = re.compile(r"^\s*(#+)\s*(.*)$")
+_BUL_LIST_GUARD_RE = re.compile(r"^\*+\s*\S")
+_BUL_LIST_SPLIT_RE = re.compile(r"^\s*(\*+)\s*(.*)$")
+_BOLD_LINE_RE = re.compile(r"^\*\*[^*].*\*\*$")
+_INDENT_LIST_RE = re.compile(r"^(:+)(\*+|#+)\s*(.+)$")
+_COLON_PROSE_RE = re.compile(r"^:+\s*\S")
+_COLON_PREFIX_RE = re.compile(r"^:+\s*")
+_BEHAVIOR_SWITCH_RE = re.compile(
+    r"__(?:NOTOC|TOC|FORCETOC|NOEDITSECTION|NEWSECTIONLINK|NONEWSECTIONLINK|HIDDENCAT|INDEX|NOINDEX|STATICREDIRECT)__",
     re.IGNORECASE,
 )
 
@@ -498,11 +517,7 @@ def _strip_cell_attrs(cell: str) -> str:
     cell = cell.strip()
     if "|" in cell and not cell.startswith("[[") and not cell.startswith("{{"):
         attr_candidate, rest = cell.split("|", 1)
-        if re.search(
-            r"\b(?:style|class|width|height|align|valign|colspan|rowspan|bgcolor|scope|border)\s*=",
-            attr_candidate,
-            flags=re.IGNORECASE,
-        ):
+        if _CELL_ATTR_RE.search(attr_candidate):
             return rest.strip()
     return cell
 
@@ -749,7 +764,7 @@ def _convert_lists_and_headings(text: str) -> str:
             continue
 
         # MediaWiki heading: = H1 =, == H2 ==, === H3 ===
-        h_match = re.match(r"^(=+)\s*(.*?)\s*\1\s*$", stripped)
+        h_match = _HEADING_EQ_RE.match(stripped)
         if h_match:
             eq_count = len(h_match.group(1))
             md_level = max(2, min(6, eq_count if eq_count >= 2 else 2))
@@ -759,23 +774,23 @@ def _convert_lists_and_headings(text: str) -> str:
             continue
 
         # MediaWiki numbered list (`# item`, `## subitem`) — avoid `#REDIRECT`
-        if re.match(r"^#+\s*(?!redirect\b)\S", line.lstrip(), flags=re.IGNORECASE):
-            num_match = re.match(r"^\s*(#+)\s*(.*)$", line)
+        if _NUM_LIST_GUARD_RE.match(line.lstrip()):
+            num_match = _NUM_LIST_SPLIT_RE.match(line)
             if num_match:
                 indent = "  " * (len(num_match.group(1)) - 1)
                 out_lines.append(f"{indent}1. {num_match.group(2).strip()}")
                 continue
 
         # MediaWiki bullet list (`* item`, `** subitem`) — ignore already-rendered Markdown `**Bold**` lines!
-        if re.match(r"^\*+\s*\S", stripped) and not re.match(r"^\*\*[^*].*\*\*$", stripped):
-            bul_match = re.match(r"^\s*(\*+)\s*(.*)$", line)
+        if _BUL_LIST_GUARD_RE.match(stripped) and not _BOLD_LINE_RE.match(stripped):
+            bul_match = _BUL_LIST_SPLIT_RE.match(line)
             if bul_match:
                 indent = "  " * (len(bul_match.group(1)) - 1)
                 out_lines.append(f"{indent}- {bul_match.group(2).strip()}")
                 continue
 
         # MediaWiki indented bullet (`:* item` or `:# item`)
-        indent_list_m = re.match(r"^(:+)(\*+|#+)\s*(.+)$", stripped)
+        indent_list_m = _INDENT_LIST_RE.match(stripped)
         if indent_list_m:
             depth_indent = "  " * len(indent_list_m.group(1))
             marker = "1." if indent_list_m.group(2).startswith("#") else "-"
@@ -783,8 +798,8 @@ def _convert_lists_and_headings(text: str) -> str:
             continue
 
         # MediaWiki colon-indented prose (`:Welcome...` or `::Note...`)
-        if re.match(r"^:+\s*\S", stripped):
-            out_lines.append(re.sub(r"^:+\s*", "", stripped))
+        if _COLON_PROSE_RE.match(stripped):
+            out_lines.append(_COLON_PREFIX_RE.sub("", stripped))
             continue
 
         # MediaWiki definition term (`; Term : Def` or `; Term`)
@@ -854,12 +869,7 @@ def clean_wikitext_body(
     text = re.sub(r"<nowiki\b[^>]*>(.*?)</nowiki>", _repl_nowiki, text, flags=re.IGNORECASE | re.DOTALL)
 
     # Remove MediaWiki magic behavior switches (__NOTOC__, __TOC__, __NOEDITSECTION__, etc.)
-    text = re.sub(
-        r"__(?:NOTOC|TOC|FORCETOC|NOEDITSECTION|NEWSECTIONLINK|NONEWSECTIONLINK|HIDDENCAT|INDEX|NOINDEX|STATICREDIRECT)__",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _BEHAVIOR_SWITCH_RE.sub("", text)
     # Resolve any unexpanded template parameter placeholders `{{{param|default}}}` -> `default` (or empty)
     text = re.sub(r"\{\{\{[^{}|]+\|([^{}]*)\}\}\}", r"\1", text)
     text = re.sub(r"\{\{\{[^{}]+\}\}\}", "", text)
@@ -899,13 +909,18 @@ def clean_wikitext_body(
     return text.strip()
 
 
-def process_raw_wikitext() -> Dict[str, int]:
+def process_raw_wikitext(
+    template_registry: Optional[Dict[str, TemplateRecord]] = None,
+    pages: Optional[List[RawPageRecord]] = None,
+) -> Dict[str, int]:
     PAGES_DIR.mkdir(parents=True, exist_ok=True)
     for old_md in PAGES_DIR.glob("*.md"):
         old_md.unlink()
 
-    template_registry = load_template_registry(TEMPLATE_DIR)
-    pages = load_all_raw_pages(RAW_DIR, template_registry=template_registry)
+    if template_registry is None:
+        template_registry = load_template_registry(TEMPLATE_DIR)
+    if pages is None:
+        pages = load_all_raw_pages(RAW_DIR, template_registry=template_registry)
     pages_by_title = build_page_title_index(pages)
 
     processed = 0
@@ -946,9 +961,12 @@ def process_raw_wikitext() -> Dict[str, int]:
         out_file.write_text(md_content, encoding="utf-8")
         processed += 1
 
-    print(
-        f"Finished cleaning {processed} pages ({redirects} redirects, "
-        f"{processed - redirects} content articles) into {PAGES_DIR}"
+    logger.info(
+        "Finished cleaning %d pages (%d redirects, %d content articles) into %s",
+        processed,
+        redirects,
+        processed - redirects,
+        PAGES_DIR,
     )
     return {"pages_cleaned": processed, "redirects": redirects}
 

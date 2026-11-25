@@ -1,12 +1,15 @@
-"""Shared MediaWiki API client, title/redirect/category/template resolution, and security utilities."""
+"""Shared MediaWiki API client, cloud config defaults, logging, title/redirect/template resolution, and security utilities."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import http.cookiejar
 import json
+import logging
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -34,7 +37,41 @@ for _venv_candidate in (
 
 import mwparserfromhell  # noqa: E402
 
-WIKI_BASE_ARTICLE_URL = "https://aow.eu.airbus.corp/wiki/"
+# ---------------------------------------------------------------------------
+# Shared MediaWiki & Cloud Configuration Defaults (Single Source of Truth)
+# ---------------------------------------------------------------------------
+DEFAULT_API_URL = os.environ.get("MEDIAWIKI_API_URL", "https://aow.eu.airbus.corp/api.php")
+WIKI_BASE_ARTICLE_URL = os.environ.get("MEDIAWIKI_BASE_ARTICLE_URL", "https://aow.eu.airbus.corp/wiki/")
+REQUEST_TIMEOUT_SECONDS = 30
+
+DEFAULT_SOURCE_PROJECT = os.environ.get("SOURCE_GCP_PROJECT", "prj-c9ec-data-dom-dev-ec")
+DEFAULT_GCS_BUCKET = os.environ.get("WIKI_GCS_BUCKET", "mediawiki-data-nov-25")
+DEFAULT_GCS_PREFIX = os.environ.get("WIKI_GCS_PREFIX", "")
+DEFAULT_BQ_LOCATION = os.environ.get("BQ_LOCATION", "EU")
+DEFAULT_BQ_SOURCE_DATASET = os.environ.get("BQ_SOURCE_DATASET", "wiki_raw_internal")
+DEFAULT_BQ_VIEW_DATASET = os.environ.get("BQ_AUTHORIZED_VIEW_DATASET", "wiki_vertex_authorized")
+
+DEFAULT_VERTEX_PROJECT = os.environ.get("TARGET_VERTEX_PROJECT", "prj-7efd-everydai-dev-4f9a")
+DEFAULT_VERTEX_PROJECT_NUMBER = os.environ.get("TARGET_VERTEX_PROJECT_NUMBER", "")
+DEFAULT_VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "eu")
+DEFAULT_RAW_DATASTORE_ID = os.environ.get("VERTEX_RAW_DATASTORE_ID", "gemini-enterprise-wiki-raw")
+DEFAULT_CHUNKED_DATASTORE_ID = os.environ.get("VERTEX_CHUNKED_DATASTORE_ID", "gemini-enterprise-wiki-chunked")
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a consistently formatted logger suitable for both local CLI and GCP Cloud Logging."""
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            stream=sys.stdout,
+        )
+    return logging.getLogger(name)
+
+
+logger = get_logger("wiki_utils")
 
 # Invisible directional / zero-width characters occasionally present in MediaWiki titles/categories
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\ufeff]")
@@ -62,52 +99,17 @@ _RETRYABLE_MW_ERROR_CODES = {
 
 # Magic words / parser variables that look like 0-arg templates ({{PAGENAME}}, {{NUMBEROFARTICLES}}, etc.)
 _MEDIAWIKI_MAGIC_WORDS = {
-    "pagename",
-    "pagenamee",
-    "fullpagename",
-    "fullpagenamee",
-    "basepagename",
-    "subpagename",
-    "rootpagename",
-    "talkpagename",
-    "subjectpagename",
-    "namespace",
-    "namespacenumber",
-    "talkspace",
-    "subjectspace",
-    "servername",
-    "server",
-    "scriptpath",
-    "stylepath",
-    "sitename",
-    "currentyear",
-    "currentmonth",
-    "currentmonthname",
-    "currentday",
-    "currentday2",
-    "currentdayname",
-    "currenttime",
-    "currenttimestamp",
-    "localyear",
-    "localmonth",
-    "localday",
-    "localtime",
-    "localtimestamp",
-    "revisionid",
-    "revisionday",
-    "revisionmonth",
-    "revisionyear",
-    "revisiontimestamp",
-    "revisionuser",
-    "numberofpages",
-    "numberofarticles",
-    "numberoffiles",
-    "numberofedits",
-    "numberofusers",
-    "numberofadmins",
-    "numberofactiveusers",
-    "!",
-    "=",
+    "pagename", "pagenamee", "fullpagename", "fullpagenamee",
+    "basepagename", "subpagename", "rootpagename", "talkpagename",
+    "subjectpagename", "namespace", "namespacenumber", "talkspace",
+    "subjectspace", "servername", "server", "scriptpath", "stylepath",
+    "sitename", "currentyear", "currentmonth", "currentmonthname",
+    "currentday", "currentday2", "currentdayname", "currenttime",
+    "currenttimestamp", "localyear", "localmonth", "localday",
+    "localtime", "localtimestamp", "revisionid", "revisionday",
+    "revisionmonth", "revisionyear", "revisiontimestamp", "revisionuser",
+    "numberofpages", "numberofarticles", "numberoffiles", "numberofedits",
+    "numberofusers", "numberofadmins", "numberofactiveusers", "!", "=",
 }
 
 # Template maintenance categories that should not propagate onto content pages
@@ -123,6 +125,12 @@ _EXCLUDED_TEMPLATE_CATEGORIES = {
     "wikipedia help navigation",
     "container categories",
     "mbox templates",
+}
+
+_WINDOWS_RESERVED_STEMS = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
 }
 
 
@@ -166,11 +174,10 @@ def strip_invisible_chars(value: str) -> str:
     return _INVISIBLE_CHARS_RE.sub("", value or "")
 
 
-_WINDOWS_RESERVED_STEMS = {
-    "con", "prn", "aux", "nul",
-    *(f"com{i}" for i in range(1, 10)),
-    *(f"lpt{i}" for i in range(1, 10)),
-}
+def validate_https_url(url: str) -> str:
+    if not (url or "").lower().startswith("https://"):
+        raise ValueError(f"Refusing insecure non-HTTPS MediaWiki API URL: {url!r}")
+    return url
 
 
 def safe_child_path(base_dir: Path, unsafe_filename: str, max_stem_len: int = 100) -> Path:
@@ -191,6 +198,79 @@ def safe_child_path(base_dir: Path, unsafe_filename: str, max_stem_len: int = 10
     if not candidate.is_relative_to(resolved_base):
         raise ValueError(f"Path traversal blocked for filename: {unsafe_filename!r}")
     return candidate
+
+
+def reset_staging_dir(parent_dir: Path, staging_name: str) -> Path:
+    """Create a fresh hidden staging subdirectory inside `parent_dir` for atomic commits."""
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = safe_child_path(parent_dir, staging_name)
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    return staging_dir
+
+
+def commit_staged_files(
+    staging_dir: Path,
+    target_dir: Path,
+    glob_pattern: str,
+    clean_existing: bool = True,
+) -> int:
+    """Atomically swap staged files matching `glob_pattern` into `target_dir` and clean up `staging_dir`."""
+    staged_files = sorted(staging_dir.glob(glob_pattern))
+    if not staged_files:
+        raise RuntimeError(f"No `{glob_pattern}` files staged in {staging_dir}; leaving {target_dir} intact.")
+
+    if clean_existing:
+        for old_file in target_dir.glob(glob_pattern):
+            old_file.unlink()
+
+    for staged_file in staged_files:
+        dest = safe_child_path(target_dir, staged_file.name)
+        shutil.move(str(staged_file), str(dest))
+
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    return len(staged_files)
+
+
+def add_common_mediawiki_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Attach standard corporate proxy, SSO cookie, and maxlag CLI flags to MediaWiki crawler scripts."""
+    parser.add_argument(
+        "--bypass-proxy",
+        action="store_true",
+        help="Ignore HTTP_PROXY/HTTPS_PROXY environment variables for direct internal .airbus.corp access.",
+    )
+    parser.add_argument(
+        "--cookie-file",
+        default=None,
+        help="Optional Netscape cookies.txt file for corporate SSO authentication (or set MEDIAWIKI_COOKIE).",
+    )
+    parser.add_argument(
+        "--maxlag",
+        type=int,
+        default=15,
+        help="MediaWiki maxlag threshold in seconds (automatically retries with backoff if exceeded).",
+    )
+
+
+def is_generator_advancing(continue_token: Dict[str, Any]) -> bool:
+    """Return True only when all sub-property continuations (`rvcontinue`, `clcontinue`) are finished."""
+    if "gapcontinue" not in continue_token:
+        return False
+    cont_str = str(continue_token.get("continue") or "")
+    # In MediaWiki's `<gen>|<list>|<prop>` token, leading `||` means generator is paused for sub-props
+    if cont_str.startswith("||"):
+        return False
+    sub_keys = {k for k in continue_token if k not in {"gapcontinue", "continue"}}
+    return len(sub_keys) == 0
+
+
+def to_vertex_struct_doc(flat_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap a flat BigQuery row dictionary into Vertex AI Search GCS `structData` format."""
+    return {
+        "id": flat_row["id"],
+        "structData": {k: v for k, v in flat_row.items() if k != "id"},
+    }
 
 
 def extract_revision_wikitext(rev_obj: Dict[str, object]) -> str:
@@ -265,7 +345,6 @@ def create_mediawiki_session(
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 
-    # Use OS native trust store on Windows/macOS if `truststore` is installed (helps with Airbus internal PKI)
     ca_bundle = (
         os.environ.get("MEDIAWIKI_CA_BUNDLE")
         or os.environ.get("REQUESTS_CA_BUNDLE")
@@ -289,10 +368,8 @@ def create_mediawiki_session(
     if ca_bundle:
         session.verify = ca_bundle
     if bypass_proxy:
-        # Prevent external internet HTTP_PROXY from intercepting internal *.airbus.corp calls
         session.trust_env = False
 
-    # Support corporate SSO session cookies via file or MEDIAWIKI_COOKIE env var (never logged)
     effective_cookie_file = cookie_file or os.environ.get("MEDIAWIKI_COOKIE_FILE", "").strip()
     if effective_cookie_file:
         session.cookies.update(_load_cookie_jar(effective_cookie_file))
@@ -338,16 +415,14 @@ def mw_api_request(
     params: Optional[Dict[str, str]] = None,
     data: Optional[Dict[str, str]] = None,
     method: str = "GET",
-    timeout: int = 30,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
     context: str = "MediaWiki API",
     max_app_retries: int = 5,
 ) -> Dict[str, Any]:
     """Execute a MediaWiki API call with TLS/proxy/SSO HTML diagnostics and `maxlag` HTTP-200 backoff."""
     import requests
 
-    if not api_url.lower().startswith("https://"):
-        raise ValueError(f"Refusing insecure non-HTTPS MediaWiki API URL: {api_url!r}")
-
+    validate_https_url(api_url)
     method_upper = method.upper()
     if method_upper not in {"GET", "POST"}:
         raise ValueError(f"Unsupported HTTP method for MediaWiki API: {method!r}")
@@ -405,9 +480,13 @@ def mw_api_request(
                     wait_secs = min(max(float(retry_hdr), 1.0), 30.0)
                 except ValueError:
                     wait_secs = min(2.0 ** attempt, 30.0)
-                print(
-                    f"  [{context}] Transient MediaWiki `{err_code}` (attempt {attempt}/{max_app_retries}); "
-                    f"backing off {wait_secs:.1f}s..."
+                logger.warning(
+                    "[%s] Transient MediaWiki `%s` (attempt %d/%d); backing off %.1fs...",
+                    context,
+                    err_code,
+                    attempt,
+                    max_app_retries,
+                    wait_secs,
                 )
                 time.sleep(wait_secs)
                 continue
@@ -418,7 +497,7 @@ def mw_api_request(
     raise RuntimeError(f"{context}: Exhausted {max_app_retries} retries against {api_url}.")
 
 
-def maybe_login_mediawiki(session, api_url: str, timeout: int = 30) -> None:
+def maybe_login_mediawiki(session, api_url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> None:
     """Authenticate once per session via MediaWiki BotPassword if MEDIAWIKI_BOT_USER & MEDIAWIKI_BOT_PASSWORD are set."""
     if getattr(session, "_mw_logged_in", False):
         return
@@ -460,7 +539,7 @@ def maybe_login_mediawiki(session, api_url: str, timeout: int = 30) -> None:
         raise RuntimeError(f"MediaWiki login failed (result={result!r}): {reason}")
 
     setattr(session, "_mw_logged_in", True)
-    print(f"Authenticated to MediaWiki API as {bot_user}")
+    logger.info("Authenticated to MediaWiki API as %s", bot_user)
 
 
 def merge_mediawiki_page_payload(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
@@ -484,7 +563,7 @@ def backfill_missing_revisions(
     session,
     api_url: str,
     pages_dict: Dict[str, Dict[str, Any]],
-    timeout: int = 30,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
     context: str = "MediaWiki single-page revision backfill",
 ) -> int:
     """Fetch individual `pageids=<pid>` for any valid page whose revision was omitted/truncated in a 50-page batch."""
@@ -541,10 +620,7 @@ def backfill_missing_revisions(
 
 
 def make_rfc1034_id(raw_value: object, fallback: str = "doc-0") -> str:
-    """Build a deterministic RFC-1034-compliant document ID (1-63 chars, [a-z0-9-] only).
-
-    Required by Vertex AI Search BigQuerySource (`idField`) and compatible with GcsSource.
-    """
+    """Build a deterministic RFC-1034-compliant document ID (1-63 chars, [a-z0-9-] only)."""
     raw_str = strip_invisible_chars(str(raw_value or fallback)).strip().lower()
     slug = re.sub(r"[^a-z0-9-]+", "-", raw_str)
     slug = re.sub(r"-{2,}", "-", slug).strip("-")
@@ -558,9 +634,13 @@ def make_rfc1034_id(raw_value: object, fallback: str = "doc-0") -> str:
     return slug
 
 
+_WHITESPACE_TOKEN_RE = re.compile(r"\S+")
+_MULTI_SPACE_RE = re.compile(r"\s+")
+
+
 def estimate_tokens(text: str) -> int:
     """Approximate LLM/embedding token count (~1.3x whitespace-delimited tokens)."""
-    return int(len(re.findall(r"\S+", text or "")) * 1.3)
+    return int(len(_WHITESPACE_TOKEN_RE.findall(text or "")) * 1.3)
 
 
 def canonical_wiki_uri(title: str, base_url: str = WIKI_BASE_ARTICLE_URL) -> str:
@@ -569,18 +649,15 @@ def canonical_wiki_uri(title: str, base_url: str = WIKI_BASE_ARTICLE_URL) -> str
 
 
 def normalize_title_key(title: str) -> str:
-    """Case-insensitive normalized title key (used as secondary fallback when exact MediaWiki casing doesn't match)."""
+    """Case-insensitive normalized title key (secondary fallback when exact MediaWiki casing doesn't match)."""
     cleaned = strip_invisible_chars(title or "").strip().lstrip(":").replace("_", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.lower()
+    return _MULTI_SPACE_RE.sub(" ", cleaned).lower()
 
 
 def mw_canonical_title_key(title: str) -> str:
-    """MediaWiki `first-letter` canonical title key: case-insensitive namespace + capitalized first title letter,
-    preserving case on remaining characters so `Main Page` (id=1) and `Main page` (id=10002) stay distinct!
-    """
+    """MediaWiki `first-letter` canonical title key: case-insensitive namespace + capitalized first title letter."""
     cleaned = strip_invisible_chars(title or "").strip().lstrip(":").replace("_", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = _MULTI_SPACE_RE.sub(" ", cleaned)
     if not cleaned:
         return ""
 
@@ -589,37 +666,37 @@ def mw_canonical_title_key(title: str) -> str:
         ns_norm = ns_part.strip().lower()
         rest = rest.strip()
         if rest:
-            rest_canon = rest[0].upper() + rest[1:]
-            return f"{ns_norm}:{rest_canon}"
+            return f"{ns_norm}:{rest[0].upper() + rest[1:]}"
         return ns_norm
 
     return cleaned[0].upper() + cleaned[1:]
 
 
 def normalize_template_key(name: str) -> str:
-    cleaned = strip_invisible_chars(name or "").strip()
-    if cleaned.startswith(":"):
-        cleaned = cleaned[1:].strip()
+    cleaned = strip_invisible_chars(name or "").strip().lstrip(":").strip()
     if cleaned.lower().startswith("template:"):
         cleaned = cleaned[len("template:") :].strip()
     cleaned = cleaned.replace("_", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.lower()
+    return _MULTI_SPACE_RE.sub(" ", cleaned).lower()
 
 
 def clean_category_name(raw_cat: str) -> str:
-    part = raw_cat.split("|", 1)[0]
-    part = strip_invisible_chars(part)
+    part = strip_invisible_chars(raw_cat.split("|", 1)[0])
     part = re.sub(r"^(?i:category)\s*:\s*", "", part)
     part = part.replace("_", " ")
-    part = re.sub(r"\s+", " ", part).strip()
-    return part
+    return _MULTI_SPACE_RE.sub(" ", part).strip()
+
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_NOWIKI_BLOCK_RE = re.compile(r"<nowiki\b[^>]*>.*?</nowiki>", re.IGNORECASE | re.DOTALL)
+_NOINCLUDE_BLOCK_RE = re.compile(r"<noinclude\b[^>]*>.*?</noinclude>", re.IGNORECASE | re.DOTALL)
+_ONLYINCLUDE_BLOCK_RE = re.compile(r"<onlyinclude\b[^>]*>(.*?)</onlyinclude>", re.IGNORECASE | re.DOTALL)
+_INCLUDEONLY_TAG_RE = re.compile(r"</?includeonly\b[^>]*>", re.IGNORECASE)
+_INCLUDE_TAGS_RE = re.compile(r"</?(?:includeonly|onlyinclude)\b[^>]*>", re.IGNORECASE)
 
 
 def _strip_comments_and_nowiki(wikitext: str) -> str:
-    text = re.sub(r"<!--.*?-->", "", wikitext, flags=re.DOTALL)
-    text = re.sub(r"<nowiki\b[^>]*>.*?</nowiki>", "", text, flags=re.IGNORECASE | re.DOTALL)
-    return text
+    return _NOWIKI_BLOCK_RE.sub("", _HTML_COMMENT_RE.sub("", wikitext))
 
 
 def extract_transcludable_wikitext(template_wikitext: str) -> Tuple[str, str]:
@@ -627,46 +704,21 @@ def extract_transcludable_wikitext(template_wikitext: str) -> Tuple[str, str]:
     if not template_wikitext:
         return "", ""
 
-    non_noinclude = re.sub(
-        r"<noinclude\b[^>]*>.*?</noinclude>",
-        "",
-        template_wikitext,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    onlyinclude_blocks = re.findall(
-        r"<onlyinclude\b[^>]*>(.*?)</onlyinclude>",
-        template_wikitext,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    non_noinclude = _NOINCLUDE_BLOCK_RE.sub("", template_wikitext)
+    onlyinclude_blocks = _ONLYINCLUDE_BLOCK_RE.findall(template_wikitext)
     if onlyinclude_blocks:
         active = "\n".join(block.strip() for block in onlyinclude_blocks if block.strip())
     else:
         active = non_noinclude
 
-    active = re.sub(
-        r"</?includeonly\b[^>]*>",
-        "",
-        active,
-        flags=re.IGNORECASE,
-    )
-    non_noinclude = re.sub(
-        r"</?(?:includeonly|onlyinclude)\b[^>]*>",
-        "",
-        non_noinclude,
-        flags=re.IGNORECASE,
-    )
+    active = _INCLUDEONLY_TAG_RE.sub("", active)
+    non_noinclude = _INCLUDE_TAGS_RE.sub("", non_noinclude)
     return active.strip(), non_noinclude.strip()
 
 
 def extract_explicit_categories(wikitext: str) -> List[str]:
     """Extract ordered, deduplicated [[Category:...]] names (ignoring [[:Category:...]] links)."""
-    scannable = _strip_comments_and_nowiki(wikitext or "")
-    scannable = re.sub(
-        r"<noinclude\b[^>]*>.*?</noinclude>",
-        "",
-        scannable,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    scannable = _NOINCLUDE_BLOCK_RE.sub("", _strip_comments_and_nowiki(wikitext or ""))
     seen = set()
     categories: List[str] = []
     for match in _CATEGORY_TAG_RE.finditer(scannable):
@@ -689,8 +741,7 @@ def detect_redirect(wikitext: str) -> Tuple[bool, Optional[str]]:
     match = _REDIRECT_RE.match(wikitext or "")
     if not match:
         return False, None
-    target = strip_invisible_chars(match.group(1)).replace("_", " ").strip()
-    target = re.sub(r"\s+", " ", target)
+    target = _MULTI_SPACE_RE.sub(" ", strip_invisible_chars(match.group(1)).replace("_", " ").strip())
     return (True, target) if target else (False, None)
 
 
@@ -713,7 +764,6 @@ def extract_transclusion_references(wikitext: str) -> Tuple[List[str], List[str]
         if not raw_name or raw_name.startswith("#"):
             continue
 
-        # Leading `:` always transcludes a Main-namespace (or specified namespace) page, e.g. `{{:SA MLG Gears}}`
         if raw_name.startswith(":"):
             target_title = raw_name[1:].strip()
             if target_title:
@@ -723,11 +773,9 @@ def extract_transclusion_references(wikitext: str) -> Tuple[List[str], List[str]
                     ordered_pages.append(target_title)
             continue
 
-        # Skip built-in 0-arg magic words ({{PAGENAME}}, {{NUMBEROFARTICLES}}, etc.)
         if not tpl.params and raw_name.lower() in _MEDIAWIKI_MAGIC_WORDS:
             continue
 
-        # Cross-namespace transclusion (`{{Category:CPIOM}}`, `{{LGSIM:Header}}`) vs `{{Template:Foo}}`
         if ":" in raw_name and not raw_name.lower().startswith("template:"):
             ns_prefix = raw_name.split(":", 1)[0].strip().lower()
             if ns_prefix != "special":
@@ -746,12 +794,6 @@ def extract_transclusion_references(wikitext: str) -> Tuple[List[str], List[str]
     return ordered_tpls, ordered_pages
 
 
-def extract_referenced_template_keys(wikitext: str) -> List[str]:
-    """Extract normalized Namespace-10 template names referenced in a page's wikitext."""
-    tpl_keys, _ = extract_transclusion_references(wikitext)
-    return tpl_keys
-
-
 def merge_unique_strings(*iterables: Iterable[str]) -> List[str]:
     seen = set()
     merged: List[str] = []
@@ -768,9 +810,7 @@ def merge_unique_strings(*iterables: Iterable[str]) -> List[str]:
 
 
 def load_all_template_records(template_dir: Path) -> List[TemplateRecord]:
-    """Load every unique `Template:*` record from `wikimedia-data/templates/*.json` (without case-folding collisions)
-    and resolve `#REDIRECT [[Template:...]]` chains so redirect templates inherit target body & categories.
-    """
+    """Load every unique `Template:*` record from `wikimedia-data/templates/*.json` and resolve `#REDIRECT` chains."""
     if not template_dir.exists():
         return []
 
@@ -789,9 +829,8 @@ def load_all_template_records(template_dir: Path) -> List[TemplateRecord]:
         if not title:
             continue
         raw_wt = str(payload.get("wikitext") or "")
-        page_id_raw = payload.get("page_id") or 0
         try:
-            page_id = int(page_id_raw)
+            page_id = int(payload.get("page_id") or 0)
         except (TypeError, ValueError):
             page_id = 0
 
@@ -836,7 +875,6 @@ def load_all_template_records(template_dir: Path) -> List[TemplateRecord]:
 
     records = sorted(by_unique_key.values(), key=lambda t: (t.page_id, t.title))
 
-    # Build canonical & lowercase lookup maps (preferring non-redirect templates) to resolve `#REDIRECT` chains
     by_canon: Dict[str, TemplateRecord] = {mw_canonical_title_key(r.title): r for r in records}
     by_norm: Dict[str, TemplateRecord] = {}
     for r in records:
@@ -847,8 +885,6 @@ def load_all_template_records(template_dir: Path) -> List[TemplateRecord]:
     for r in records:
         if not r.is_redirect or not r.redirect_target:
             continue
-        # Note: Some MediaWiki templates (e.g. `Template:Docmaster`) have BOTH `#REDIRECT` AND `<onlyinclude>` body!
-        # Only overwrite transcludable_wikitext if the redirect stub has no `<onlyinclude>` body of its own.
         has_own_onlyinclude = "<onlyinclude" in r.raw_wikitext.lower()
         curr = r
         visited = {mw_canonical_title_key(r.title)}
@@ -856,10 +892,7 @@ def load_all_template_records(template_dir: Path) -> List[TemplateRecord]:
             if not curr.is_redirect or not curr.redirect_target:
                 break
             tgt_raw = curr.redirect_target
-            if not tgt_raw.lower().startswith("template:") and ":" not in tgt_raw:
-                tgt_full = f"Template:{tgt_raw}"
-            else:
-                tgt_full = tgt_raw
+            tgt_full = f"Template:{tgt_raw}" if (not tgt_raw.lower().startswith("template:") and ":" not in tgt_raw) else tgt_raw
             c_key = mw_canonical_title_key(tgt_full)
             nxt = by_canon.get(c_key) or by_norm.get(normalize_template_key(tgt_raw))
             if nxt is None or mw_canonical_title_key(nxt.title) in visited:
@@ -877,14 +910,19 @@ def load_all_template_records(template_dir: Path) -> List[TemplateRecord]:
     return records
 
 
-def load_template_registry(template_dir: Path) -> Dict[str, TemplateRecord]:
-    """Return normalized template lookup dictionary (preferring real templates over case-variant redirect stubs)."""
+def load_template_registry(
+    template_dir: Optional[Path] = None,
+    records: Optional[Iterable[TemplateRecord]] = None,
+) -> Dict[str, TemplateRecord]:
+    """Build normalized template lookup dictionary from either `records` (in-memory) or `template_dir`."""
+    source_records = list(records) if records is not None else (
+        load_all_template_records(template_dir) if template_dir is not None else []
+    )
     registry: Dict[str, TemplateRecord] = {}
-    for rec in load_all_template_records(template_dir):
+    for rec in source_records:
         existing = registry.get(rec.norm_key)
         if existing is None or (existing.is_redirect and not rec.is_redirect):
             registry[rec.norm_key] = rec
-        # Also index exact MediaWiki canonical short name (`first-letter` case)
         canon_short = mw_canonical_title_key(rec.name)
         if canon_short and canon_short not in registry:
             registry[canon_short] = rec
@@ -972,7 +1010,6 @@ def load_all_raw_pages(
                 content_model = extract_revision_content_model(rev0)
                 wikitext = extract_revision_wikitext(rev0)
 
-            # Prefer existing record if it already has non-empty wikitext and new stub is empty
             existing = pages_by_id.get(pid)
             if existing and existing.wikitext and not wikitext:
                 continue
@@ -1021,8 +1058,6 @@ def load_all_raw_pages(
     ordered_pages = [pages_by_id[pid] for pid in sorted(pages_by_id)]
     title_index = build_page_title_index(ordered_pages)
 
-    # Resolve multi-hop redirect chains (`A -> B -> C`) onto the final non-redirect target page
-    # without self-aliasing case-variant stubs (`Main page` -> `Main Page`), and propagate redirect categories!
     aliases_by_pid: Dict[int, List[str]] = {}
     redirect_cats_by_pid: Dict[int, List[str]] = {}
 
