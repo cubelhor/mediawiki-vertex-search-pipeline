@@ -258,14 +258,28 @@ def fetch_wiki_batches(
                     break
                 seen_request_signatures.add(req_sig)
 
-                data = mw_api_request(
-                    sess,
-                    base_url,
-                    params=params,
-                    method="GET",
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                    context=f"MediaWiki query (ns={ns_id})",
-                )
+                try:
+                    data = mw_api_request(
+                        sess,
+                        base_url,
+                        params=params,
+                        method="GET",
+                        timeout=REQUEST_TIMEOUT_SECONDS,
+                        context=f"MediaWiki query (ns={ns_id})",
+                    )
+                except RuntimeError as api_err:
+                    err_low = str(api_err).lower()
+                    is_acl_denial = any(
+                        token in err_low
+                        for token in ("readapidenied", "permissiondenied", "http 403", "access denied", "not allowed")
+                    )
+                    if ns_id != 0 and is_acl_denial:
+                        print(
+                            f"  [SKIPPED] Namespace {ns_id} ({ns_name}) denied by MediaWiki ACL; continuing to next namespace."
+                        )
+                        window_pages = {}
+                        break
+                    raise
 
                 pages = data.get("query", {}).get("pages", {})
                 if not pages and not window_pages:

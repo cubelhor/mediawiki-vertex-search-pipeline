@@ -97,14 +97,15 @@ def build_option_specs(
     chunked_datastore_id: str,
 ) -> List[PipelineOptionSpec]:
     prefix = gcs_prefix.strip("/")
+    prefix_part = f"{prefix}/" if prefix else ""
     return [
         PipelineOptionSpec(
             key="raw",
             label="Option 1 (Raw Wikitext + Templates + Categories)",
             local_bq_jsonl=ROOT / "wikimedia-data" / "jsonl-for-vertex" / "rawapi" / "raw_with_templates_bq.jsonl",
             local_gcs_doc_jsonl=ROOT / "wikimedia-data" / "jsonl-for-vertex" / "rawapi" / "rawapi-for-vertexai.jsonl",
-            gcs_bq_blob=f"{prefix}/option1_raw/raw_with_templates_bq.jsonl",
-            gcs_doc_blob=f"{prefix}/option1_raw/rawapi-for-vertexai.jsonl",
+            gcs_bq_blob=f"{prefix_part}option1_raw/raw_with_templates_bq.jsonl",
+            gcs_doc_blob=f"{prefix_part}option1_raw/rawapi-for-vertexai.jsonl",
             bq_source_table="wiki_option1_raw_templates",
             bq_authorized_view="v_wiki_option1_raw_templates",
             bq_export_table="t_wiki_option1_raw_templates_export",
@@ -116,8 +117,8 @@ def build_option_specs(
             label="Option 2 (Manual Clean + Template Expansion + Manual Chunks)",
             local_bq_jsonl=ROOT / "wikimedia-data" / "jsonl-for-vertex" / "chunks" / "chunks_bq.jsonl",
             local_gcs_doc_jsonl=ROOT / "wikimedia-data" / "jsonl-for-vertex" / "chunks" / "chunks-for-vertexai.jsonl",
-            gcs_bq_blob=f"{prefix}/option2_chunked/chunks_bq.jsonl",
-            gcs_doc_blob=f"{prefix}/option2_chunked/chunks-for-vertexai.jsonl",
+            gcs_bq_blob=f"{prefix_part}option2_chunked/chunks_bq.jsonl",
+            gcs_doc_blob=f"{prefix_part}option2_chunked/chunks-for-vertexai.jsonl",
             bq_source_table="wiki_option2_manual_chunks",
             bq_authorized_view="v_wiki_option2_manual_chunks",
             bq_export_table="t_wiki_option2_manual_chunks_export",
