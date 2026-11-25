@@ -248,11 +248,15 @@ def setup_bigquery_tables_and_authorized_views(
 
         bq = bigquery.Client(project=proj, location=bq_location)
 
-        # 1. Ensure both datasets exist
+        # 1. Ensure both datasets exist (check get_dataset first so least-privilege SAs without datasets.create succeed)
         for ds_id in (src_ds_name, view_ds_name):
-            ds_obj = bigquery.Dataset(f"{proj}.{ds_id}")
-            ds_obj.location = bq_location
-            bq.create_dataset(ds_obj, exists_ok=True)
+            ds_full = f"{proj}.{ds_id}"
+            try:
+                bq.get_dataset(ds_full)
+            except Exception:
+                ds_obj = bigquery.Dataset(ds_full)
+                ds_obj.location = bq_location
+                bq.create_dataset(ds_obj, exists_ok=True)
 
         # 2. Load GCS JSONL into a NATIVE BigQuery table (NOT an External Table!)
         src_table_ref = f"{proj}.{src_ds_name}.{src_tbl}"
@@ -266,30 +270,33 @@ def setup_bigquery_tables_and_authorized_views(
         loaded_table = bq.get_table(src_table_ref)
         print(f"Loaded {loaded_table.num_rows} rows into native table `{src_table_ref}`")
 
-        # 3. Create or update the View in the separate shared dataset
+        # 3. Create or update the View in-place (avoids transient downtime & preserves Authorized View ACLs)
         view_ref_str = f"{proj}.{view_ds_name}.{view_name}"
-        view_obj = bigquery.Table(view_ref_str)
-        view_obj.view_query = view_sql
         try:
-            bq.delete_table(view_ref_str, not_found_ok=True)
+            existing_view = bq.get_table(view_ref_str)
+            existing_view.view_query = view_sql
+            created_view = bq.update_table(existing_view, ["view_query"])
+            print(f"Updated view `{view_ref_str}` in place")
         except Exception:
-            pass
-        created_view = bq.create_table(view_obj)
-        print(f"Created view `{view_ref_str}`")
+            view_obj = bigquery.Table(view_ref_str)
+            view_obj.view_query = view_sql
+            created_view = bq.create_table(view_obj)
+            print(f"Created view `{view_ref_str}`")
 
-        # 4. Authorize the View against the restricted source dataset
-        source_dataset = bq.get_dataset(f"{proj}.{src_ds_name}")
-        access_entries = list(source_dataset.access_entries)
-        auth_entry = bigquery.AccessEntry(
-            role=None,
-            entity_type="view",
-            entity_id=created_view.reference.to_api_repr(),
-        )
-        if auth_entry not in access_entries:
-            access_entries.append(auth_entry)
-            source_dataset.access_entries = access_entries
-            bq.update_dataset(source_dataset, ["access_entries"])
-            print(f"Authorized view `{view_ref_str}` on source dataset `{proj}.{src_ds_name}`")
+        # 4. Authorize the View against the restricted source dataset (only needed when datasets differ)
+        if src_ds_name != view_ds_name:
+            source_dataset = bq.get_dataset(f"{proj}.{src_ds_name}")
+            access_entries = list(source_dataset.access_entries)
+            auth_entry = bigquery.AccessEntry(
+                role=None,
+                entity_type="view",
+                entity_id=created_view.reference.to_api_repr(),
+            )
+            if auth_entry not in access_entries:
+                access_entries.append(auth_entry)
+                source_dataset.access_entries = access_entries
+                bq.update_dataset(source_dataset, ["access_entries"])
+                print(f"Authorized view `{view_ref_str}` on source dataset `{proj}.{src_ds_name}`")
 
         # 5. Optional materialized physical table in shared dataset (for Discovery Engine bulk extract compatibility)
         if materialize_export_table:

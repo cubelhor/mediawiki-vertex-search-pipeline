@@ -93,3 +93,55 @@ To allow Vertex AI Search in **Project B** to ingest from BigQuery in **Project 
 2. `roles/bigquery.jobUser` on `Project_A`
 
 > **Note on Authorized Views vs. Materialized Export Tables**: Discovery Engine bulk ingestion (`BigQuerySource`) prohibits External Tables over GCS and can reject logical SQL Views during table extract jobs. Running `5_vertex_import_jsonl.py` with `--materialize-export-table` creates **both** the Authorized Views (`v_wiki_option1_raw_templates`, `v_wiki_option2_manual_chunks`) and physical export tables (`t_wiki_option1_raw_templates_export`, `t_wiki_option2_manual_chunks_export`) inside the shared dataset.
+
+---
+
+## Deploying as a GCP Cloud Run Job (`run_pipeline.py` + `Dockerfile`)
+
+All standalone scripts (`0_`–`5_`) remain untouched for local runs, while `run_pipeline.py`, `Dockerfile`, `.dockerignore`, and `requirements-job.txt` package the pipeline for **Cloud Run Jobs**:
+
+### 1. Test Locally Before Deploying
+```bash
+# Preview `--skip-crawl` (GCS -> BigQuery Authorized Views, no MediaWiki network needed):
+python3 run_pipeline.py --skip-crawl --dry-run \
+  --source-project "prj-c9ec-data-dom-dev-ec" \
+  --gcs-bucket "mediawiki-data-nov-25" \
+  --gcs-prefix "" \
+  --bq-source-dataset "<YOUR_SOURCE_DATASET>" \
+  --bq-view-dataset "wiki_vertex_authorized"
+```
+
+### 2. Build Container & Create Cloud Run Job in `--skip-crawl` Mode (Before OpenWiki Firewall Opens)
+```bash
+# Build container via Cloud Build (.dockerignore ensures wikimedia-data/ & secrets are never uploaded):
+gcloud artifacts repositories create wiki-pipeline \
+  --repository-format=docker --location=europe-west1 --project=prj-c9ec-data-dom-dev-ec
+
+gcloud builds submit \
+  --tag europe-west1-docker.pkg.dev/prj-c9ec-data-dom-dev-ec/wiki-pipeline/mediawiki-sync:latest \
+  --project=prj-c9ec-data-dom-dev-ec
+
+# Create Cloud Run Job running in `--skip-crawl` mode first (GCS -> BigQuery):
+gcloud run jobs create mediawiki-vertex-sync \
+  --image=europe-west1-docker.pkg.dev/prj-c9ec-data-dom-dev-ec/wiki-pipeline/mediawiki-sync:latest \
+  --region=europe-west1 \
+  --project=prj-c9ec-data-dom-dev-ec \
+  --service-account="sa-wiki-sync-job@prj-c9ec-data-dom-dev-ec.iam.gserviceaccount.com" \
+  --memory=4Gi --cpu=2 --task-timeout=3600s --max-retries=1 \
+  --set-env-vars="SKIP_CRAWL=true,SOURCE_GCP_PROJECT=prj-c9ec-data-dom-dev-ec,WIKI_GCS_BUCKET=mediawiki-data-nov-25,WIKI_GCS_PREFIX=,BQ_LOCATION=EU,BQ_SOURCE_DATASET=<YOUR_SOURCE_DATASET>,BQ_AUTHORIZED_VIEW_DATASET=wiki_vertex_authorized,MATERIALIZE_EXPORT_TABLE=true,RUN_VERTEX_IMPORT=false"
+
+# Execute a test run right now (reads from gs://mediawiki-data-nov-25/ -> loads BigQuery + Authorized Views):
+gcloud run jobs execute mediawiki-vertex-sync \
+  --region=europe-west1 --project=prj-c9ec-data-dom-dev-ec --wait
+```
+
+### 3. Switch to Full Daily Sync Once the OpenWiki Firewall Opens
+Update the Cloud Run Job with Direct VPC Egress, Secret Manager CA mount, and `SKIP_CRAWL=false` (daily `list=recentchanges` quiet-day skip + 85% drop-guard + `FULL` Vertex reconciliation):
+```bash
+gcloud run jobs update mediawiki-vertex-sync \
+  --region=europe-west1 --project=prj-c9ec-data-dom-dev-ec \
+  --network="<AIRBUS_VPC>" --subnet="<AIRBUS_SUBNET>" --vpc-egress=private-ranges-only \
+  --update-env-vars="SKIP_CRAWL=false,RUN_VERTEX_IMPORT=true,TARGET_VERTEX_PROJECT=prj-7efd-everydai-dev-4f9a,MEDIAWIKI_CA_BUNDLE=/secrets/airbus-ca.crt" \
+  --set-secrets="/secrets/airbus-ca.crt=airbus-internal-ca:latest"
+```
+
