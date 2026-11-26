@@ -62,15 +62,16 @@ python3 3_chunk_pages.py
 python3 4_generate_vertex_jsonl.py
 ```
 
-### 4. Upload to GCS → Create BigQuery Native Tables & Authorized Views (`ing-dev`) → Import to Vertex AI Search (`everyday-dev`)
+### 4. Upload to GCS (`ing-dev`) → BigQuery Native Tables & Authorized Views (`data-dom`) → Vertex AI Search (`everyday-dev`)
 ```bash
-# Preview all GCS URIs, BigQuery DDL, IAM checklist, and Vertex requests first (uses built-in ing-dev -> everyday-dev defaults):
+# Preview all GCS URIs, BigQuery DDL, IAM checklist, and Vertex requests (uses built-in 3-project defaults):
 python3 5_vertex_import_jsonl.py --dry-run --materialize-export-table
 
-# Execute GCS upload + BigQuery native table load + Authorized View setup in ing-dev (prj-c9ec-ing-ds-dev-ec):
+# Execute GCS upload (ing-dev) + BigQuery native table load & Authorized Views (data-dom):
 python3 5_vertex_import_jsonl.py \
   --steps upload-gcs setup-bq \
   --source-project "prj-c9ec-ing-ds-dev-ec" \
+  --bq-project "prj-c9ec-data-dom-dev-ec" \
   --gcs-bucket "mediawiki-data-nov-25" \
   --bq-source-dataset "wiki_raw_internal" \
   --bq-view-dataset "wiki_vertex_authorized" \
@@ -81,7 +82,7 @@ python3 5_vertex_import_jsonl.py \
   --steps import-vertex \
   --import-source bq \
   --materialize-export-table \
-  --source-project "prj-c9ec-ing-ds-dev-ec" \
+  --bq-project "prj-c9ec-data-dom-dev-ec" \
   --bq-view-dataset "wiki_vertex_authorized" \
   --vertex-project "prj-7efd-everydai-dev-4f9a" \
   --vertex-location "eu"
@@ -89,60 +90,80 @@ python3 5_vertex_import_jsonl.py \
 
 ---
 
-## Cross-Project IAM Requirements (`ing-dev` BigQuery → `everyday-dev` Vertex AI Search)
+## 3-Project Architecture & Cross-Project IAM
 
-All ingestion, GCS storage (`gs://mediawiki-data-nov-25`), Cloud Run execution, BigQuery native tables (`wiki_raw_internal`), and BigQuery Authorized Views (`wiki_vertex_authorized`) live in **`ing-dev` (`prj-c9ec-ing-ds-dev-ec`)**.
+| Layer | GCP Project | Resources |
+| :--- | :--- | :--- |
+| **1. Ingestion (`ing-dev`)** | `prj-c9ec-ing-ds-dev-ec` (`#21248470869`) | Cloud Run Job (`mediawiki-vertex-sync`, `europe-west4`), GCS bucket (`gs://mediawiki-data-nov-25`), Secret Manager, Cloud Scheduler |
+| **2. Data Domain (`data-dom`)** | `prj-c9ec-data-dom-dev-ec` | BigQuery base tables (`wiki_raw_internal`) & Authorized Views + export tables (`wiki_vertex_authorized`) |
+| **3. Consumer (`everyday-dev`)** | `prj-7efd-everydai-dev-4f9a` (`#7016082038`) | Vertex AI Search datastores (`gemini-enterprise-wiki-raw`, `gemini-enterprise-wiki-chunked`, `eu`) |
 
-To allow Vertex AI Search in **`everyday-dev` (`prj-7efd-everydai-dev-4f9a`)** to ingest from the Authorized View dataset in **`ing-dev`**, grant the following roles to `service-<EVERYDAY_DEV_PROJECT_NUMBER>@gcp-sa-discoveryengine.iam.gserviceaccount.com`:
-1. `roles/bigquery.dataViewer` on dataset `prj-c9ec-ing-ds-dev-ec.wiki_vertex_authorized`
-2. `roles/bigquery.jobUser` on project `prj-c9ec-ing-ds-dev-ec`
+- **`project-service-account@prj-c9ec-ing-ds-dev-ec.iam.gserviceaccount.com`** needs:
+  - On `prj-c9ec-ing-ds-dev-ec`: `roles/storage.objectAdmin` (`gs://mediawiki-data-nov-25`), `roles/run.invoker`, `roles/secretmanager.secretAccessor`
+  - On `prj-c9ec-data-dom-dev-ec`: `roles/bigquery.dataOwner`, `roles/bigquery.jobUser`
+  - On `prj-7efd-everydai-dev-4f9a`: `roles/discoveryengine.admin`
+- **`service-7016082038@gcp-sa-discoveryengine.iam.gserviceaccount.com`** needs:
+  - On `prj-c9ec-data-dom-dev-ec`: `roles/bigquery.dataViewer` (**dataset `wiki_vertex_authorized` ONLY**), `roles/bigquery.jobUser`, `roles/bigquery.readSessionUser`
 
-> **Note on Authorized Views vs. Materialized Export Tables**: Discovery Engine bulk ingestion (`BigQuerySource`) prohibits External Tables over GCS and can reject logical SQL Views during table extract jobs. Running with `--materialize-export-table` (enabled by default in `run_pipeline.py`) creates **both** the Authorized Views (`v_wiki_option1_raw_templates`, `v_wiki_option2_manual_chunks`) and physical export tables (`t_wiki_option1_raw_templates_export`, `t_wiki_option2_manual_chunks_export`) inside `prj-c9ec-ing-ds-dev-ec.wiki_vertex_authorized`.
+> **Note on Authorized Views vs. Materialized Export Tables**: Discovery Engine bulk ingestion (`BigQuerySource`) prohibits External Tables over GCS and can reject logical SQL Views during table extract jobs. Running with `--materialize-export-table` (enabled by default in `run_pipeline.py`) creates **both** the Authorized Views (`v_wiki_option1_raw_templates`, `v_wiki_option2_manual_chunks`) and physical export tables (`t_wiki_option1_raw_templates_export`, `t_wiki_option2_manual_chunks_export`) inside `prj-c9ec-data-dom-dev-ec.wiki_vertex_authorized`.
 
 ---
 
-## Deploying in `prj-c9ec-ing-ds-dev-ec` (`run_pipeline.py` + `Dockerfile`)
+## Deploying in `prj-c9ec-ing-ds-dev-ec` (`europe-west4` + Shared VPC)
 
-All standalone scripts (`0_`–`5_`) remain available for local runs, while `run_pipeline.py`, `Dockerfile`, `.dockerignore`, and `requirements.txt` package the pipeline to run inside **`prj-c9ec-ing-ds-dev-ec`** (`ing-dev`):
+All standalone scripts (`0_`–`5_`) remain available for local runs, while `run_pipeline.py`, `Dockerfile`, `.dockerignore`, and `requirements.txt` package the pipeline as a **Cloud Run Job**:
 
 ### 1. Test Locally Before Deploying
 ```bash
-# Preview `--skip-crawl` (GCS -> BigQuery native tables + Authorized Views in prj-c9ec-ing-ds-dev-ec):
+# Preview `--skip-crawl` (gs://mediawiki-data-nov-25 in ing-dev -> BigQuery tables + Authorized Views in data-dom):
 python3 run_pipeline.py --skip-crawl --dry-run
 ```
 
-### 2. Build Container & Create Cloud Run Job in `prj-c9ec-ing-ds-dev-ec` (`--skip-crawl` Mode)
+### 2. Build Container (EU Staging) & Deploy Cloud Run Job (`europe-west4` + Shared VPC `all-traffic`)
 ```bash
-# Build container via Cloud Build (.dockerignore ensures wikimedia-data/ & secrets are never uploaded):
+# Create Artifact Registry repository (once):
 gcloud artifacts repositories create wiki-pipeline \
   --repository-format=docker --location=europe-west1 --project=prj-c9ec-ing-ds-dev-ec
 
+# Build container strictly in EU using your existing EU GCS bucket for staging/logs:
 gcloud builds submit \
-  --tag europe-west1-docker.pkg.dev/prj-c9ec-ing-ds-dev-ec/wiki-pipeline/mediawiki-sync:latest \
+  --region=europe-west1 \
+  --service-account=projects/prj-c9ec-ing-ds-dev-ec/serviceAccounts/project-service-account@prj-c9ec-ing-ds-dev-ec.iam.gserviceaccount.com \
+  --gcs-source-staging-dir=gs://mediawiki-data-nov-25/_cloudbuild/source \
+  --gcs-log-dir=gs://mediawiki-data-nov-25/_cloudbuild/logs \
+  --tag=europe-west1-docker.pkg.dev/prj-c9ec-ing-ds-dev-ec/wiki-pipeline/mediawiki-sync:latest \
   --project=prj-c9ec-ing-ds-dev-ec
 
-# Create Cloud Run Job in prj-c9ec-ing-ds-dev-ec (reads gs://mediawiki-data-nov-25 -> loads BQ + Authorized Views in ing-dev):
-gcloud run jobs create mediawiki-vertex-sync \
+# Deploy Cloud Run Job in europe-west4 attached to Airbus Shared VPC (100.90.29.64/26):
+gcloud run jobs deploy mediawiki-vertex-sync \
   --image=europe-west1-docker.pkg.dev/prj-c9ec-ing-ds-dev-ec/wiki-pipeline/mediawiki-sync:latest \
-  --region=europe-west1 \
+  --region=europe-west4 \
   --project=prj-c9ec-ing-ds-dev-ec \
-  --service-account="sa-wiki-sync-job@prj-c9ec-ing-ds-dev-ec.iam.gserviceaccount.com" \
+  --service-account=project-service-account@prj-c9ec-ing-ds-dev-ec.iam.gserviceaccount.com \
+  --network=projects/prj-ebb5-devapp-pro-2f88/global/networks/svpc-ebb5-spoke-devapp-prod \
+  --subnet=projects/prj-ebb5-devapp-pro-2f88/regions/europe-west4/subnetworks/main-ing-ds-c9ec-ec-ew4-devapp-dev \
+  --vpc-egress=all-traffic \
   --memory=4Gi --cpu=2 --task-timeout=3600s --max-retries=1 \
-  --set-env-vars="SKIP_CRAWL=true,SOURCE_GCP_PROJECT=prj-c9ec-ing-ds-dev-ec,WIKI_GCS_BUCKET=mediawiki-data-nov-25,WIKI_GCS_PREFIX=,BQ_LOCATION=EU,BQ_SOURCE_DATASET=wiki_raw_internal,BQ_AUTHORIZED_VIEW_DATASET=wiki_vertex_authorized,MATERIALIZE_EXPORT_TABLE=true,RUN_VERTEX_IMPORT=false,TARGET_VERTEX_PROJECT=prj-7efd-everydai-dev-4f9a,VERTEX_LOCATION=eu"
+  --set-env-vars="SKIP_CRAWL=true,RUN_VERTEX_IMPORT=false"
 
-# Execute a run right now in prj-c9ec-ing-ds-dev-ec:
+# Execute a test run (reads ing-dev GCS -> loads data-dom BigQuery + Authorized Views):
 gcloud run jobs execute mediawiki-vertex-sync \
-  --region=europe-west1 --project=prj-c9ec-ing-ds-dev-ec --wait
+  --region=europe-west4 --project=prj-c9ec-ing-ds-dev-ec --wait
 ```
 
-### 3. Switch to Full Daily Sync Once the OpenWiki Firewall Opens
-Update the Cloud Run Job in `prj-c9ec-ing-ds-dev-ec` with Direct VPC Egress, Secret Manager CA mount, and `SKIP_CRAWL=false` (daily `list=recentchanges` quiet-day skip + 85% drop-guard + `FULL` Vertex reconciliation into `prj-7efd-everydai-dev-4f9a`):
+### 3. Enable Cross-Project Vertex Import & Daily Full Sync
 ```bash
+# Once IAM is granted on data-dom & everyday-dev, enable Vertex AI Search sync:
 gcloud run jobs update mediawiki-vertex-sync \
-  --region=europe-west1 --project=prj-c9ec-ing-ds-dev-ec \
-  --network="<AIRBUS_VPC>" --subnet="<AIRBUS_SUBNET>" --vpc-egress=private-ranges-only \
-  --update-env-vars="SKIP_CRAWL=false,RUN_VERTEX_IMPORT=true,TARGET_VERTEX_PROJECT=prj-7efd-everydai-dev-4f9a,MEDIAWIKI_CA_BUNDLE=/secrets/airbus-ca.crt" \
+  --region=europe-west4 --project=prj-c9ec-ing-ds-dev-ec \
+  --update-env-vars="RUN_VERTEX_IMPORT=true"
+
+# Once OpenWiki firewall opens (100.90.29.64/26 -> aow.eu.airbus.corp:443), mount CA secret & flip SKIP_CRAWL=false:
+gcloud run jobs update mediawiki-vertex-sync \
+  --region=europe-west4 --project=prj-c9ec-ing-ds-dev-ec \
+  --update-env-vars="SKIP_CRAWL=false,RUN_VERTEX_IMPORT=true,MEDIAWIKI_CA_BUNDLE=/secrets/airbus-ca.crt" \
   --set-secrets="/secrets/airbus-ca.crt=airbus-internal-ca:latest"
 ```
+
 
 

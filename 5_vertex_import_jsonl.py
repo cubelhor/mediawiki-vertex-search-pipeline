@@ -10,6 +10,7 @@ from typing import List, Sequence
 
 from wiki_utils import (
     DEFAULT_BQ_LOCATION,
+    DEFAULT_BQ_PROJECT,
     DEFAULT_BQ_SOURCE_DATASET,
     DEFAULT_BQ_VIEW_DATASET,
     DEFAULT_CHUNKED_DATASTORE_ID,
@@ -174,7 +175,7 @@ def upload_option_files_to_gcs(
 
 
 def setup_bigquery_tables_and_authorized_views(
-    source_project: str,
+    bq_project: str,
     bucket_name: str,
     bq_location: str,
     source_dataset_id: str,
@@ -183,7 +184,7 @@ def setup_bigquery_tables_and_authorized_views(
     materialize_export_table: bool = False,
     dry_run: bool = False,
 ) -> None:
-    proj = validate_gcp_project_id(source_project)
+    proj = validate_gcp_project_id(bq_project)
     bucket_clean = validate_gcs_bucket(bucket_name)
     src_ds_name = validate_bq_identifier(source_dataset_id)
     view_ds_name = validate_bq_identifier(view_dataset_id)
@@ -315,7 +316,7 @@ def ensure_datastore(
 
 
 def import_into_vertex_datastores(
-    source_project: str,
+    bq_project: str,
     bucket_name: str,
     view_dataset_id: str,
     vertex_project: str,
@@ -325,7 +326,7 @@ def import_into_vertex_datastores(
     use_materialized_table: bool = False,
     dry_run: bool = False,
 ) -> None:
-    src_proj = validate_gcp_project_id(source_project)
+    src_proj = validate_gcp_project_id(bq_project)
     dst_proj = validate_gcp_project_id(vertex_project)
     bucket_clean = validate_gcs_bucket(bucket_name)
     view_ds_name = validate_bq_identifier(view_dataset_id)
@@ -398,7 +399,7 @@ def import_into_vertex_datastores(
 
 
 def print_cross_project_iam_hint(
-    source_project: str,
+    bq_project: str,
     view_dataset_id: str,
     target_vertex_project_number: str,
 ) -> None:
@@ -406,11 +407,11 @@ def print_cross_project_iam_hint(
     sa = f"service-{proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com"
     logger.info(
         "Cross-Project IAM Checklist (Discovery Engine SA `%s`): "
-        "(1) `roles/bigquery.dataViewer` on `%s.%s`, (2) `roles/bigquery.jobUser` on `%s`.",
+        "(1) `roles/bigquery.dataViewer` on `%s.%s`, (2) `roles/bigquery.jobUser` + `roles/bigquery.readSessionUser` on `%s`.",
         sa,
-        source_project,
+        bq_project,
         view_dataset_id,
-        source_project,
+        bq_project,
     )
 
 
@@ -430,7 +431,12 @@ def add_common_cloud_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--source-project",
         default=DEFAULT_SOURCE_PROJECT,
-        help="GCP project hosting GCS bucket, BigQuery source tables, and Authorized Views (default: %(default)s).",
+        help="GCP project hosting Cloud Run Job and GCS staging bucket (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--bq-project",
+        default=DEFAULT_BQ_PROJECT,
+        help="GCP project hosting BigQuery base tables and Authorized Views (default: %(default)s).",
     )
     parser.add_argument("--gcs-bucket", default=DEFAULT_GCS_BUCKET, help="GCS bucket name (default: %(default)s).")
     parser.add_argument("--gcs-prefix", default=DEFAULT_GCS_PREFIX, help="Optional GCS object prefix (default: '%(default)s').")
@@ -438,12 +444,12 @@ def add_common_cloud_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--bq-source-dataset",
         default=DEFAULT_BQ_SOURCE_DATASET,
-        help="Restricted BigQuery dataset in source-project for native tables (default: %(default)s).",
+        help="Restricted BigQuery dataset in bq-project for native tables (default: %(default)s).",
     )
     parser.add_argument(
         "--bq-view-dataset",
         default=DEFAULT_BQ_VIEW_DATASET,
-        help="Authorized View & export dataset in source-project shared with Vertex AI Search (default: %(default)s).",
+        help="Authorized View & export dataset in bq-project shared with Vertex AI Search (default: %(default)s).",
     )
     parser.add_argument(
         "--vertex-project",
@@ -460,6 +466,7 @@ def run_cloud_deployment(
     options: Sequence[str],
     steps: Sequence[str],
     source_project: str = DEFAULT_SOURCE_PROJECT,
+    bq_project: str = DEFAULT_BQ_PROJECT,
     gcs_bucket: str = DEFAULT_GCS_BUCKET,
     gcs_prefix: str = DEFAULT_GCS_PREFIX,
     bq_location: str = DEFAULT_BQ_LOCATION,
@@ -475,7 +482,7 @@ def run_cloud_deployment(
     upload_all_variants: bool = False,
     dry_run: bool = False,
 ) -> None:
-    """Execute GCS upload, BigQuery native table + Authorized View setup, and/or Vertex AI Search imports."""
+    """Execute GCS upload (ing-dev), BigQuery tables + Authorized Views (data-dom), and Vertex imports (everyday-dev)."""
     all_specs = build_option_specs(
         gcs_prefix=gcs_prefix,
         raw_datastore_id=raw_datastore_id,
@@ -495,7 +502,7 @@ def run_cloud_deployment(
 
     if "setup-bq" in steps:
         setup_bigquery_tables_and_authorized_views(
-            source_project=source_project,
+            bq_project=bq_project,
             bucket_name=gcs_bucket,
             bq_location=bq_location,
             source_dataset_id=bq_source_dataset,
@@ -505,14 +512,14 @@ def run_cloud_deployment(
             dry_run=dry_run,
         )
         print_cross_project_iam_hint(
-            source_project=source_project,
+            bq_project=bq_project,
             view_dataset_id=bq_view_dataset,
             target_vertex_project_number=vertex_project_number,
         )
 
     if "import-vertex" in steps:
         import_into_vertex_datastores(
-            source_project=source_project,
+            bq_project=bq_project,
             bucket_name=gcs_bucket,
             view_dataset_id=bq_view_dataset,
             vertex_project=vertex_project,
@@ -555,6 +562,7 @@ def main() -> None:
         options=args.options,
         steps=args.steps,
         source_project=args.source_project,
+        bq_project=args.bq_project,
         gcs_bucket=args.gcs_bucket,
         gcs_prefix=args.gcs_prefix,
         bq_location=args.bq_location,

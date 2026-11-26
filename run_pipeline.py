@@ -307,8 +307,8 @@ def main() -> None:
         raise ValueError("`--skip-crawl` cannot be combined with `upload-gcs` (no local crawl files exist in container).")
 
     logger.info(
-        "MediaWiki Pipeline Start (%s): mode=%s, options=%s, cloud_steps=%s, source_project=%s, gcs=gs://%s/%s, "
-        "bq=%s->%s (materialize=%s), vertex=%s (%s), dry_run=%s",
+        "MediaWiki Pipeline Start (%s): mode=%s, options=%s, cloud_steps=%s, gcs_project=%s (gs://%s/%s), "
+        "bq=%s.%s->%s (materialize=%s), vertex=%s (%s), dry_run=%s",
         run_started_utc,
         "skip-crawl" if args.skip_crawl else "full-sync",
         args.options,
@@ -316,6 +316,7 @@ def main() -> None:
         args.source_project,
         args.gcs_bucket,
         args.gcs_prefix.strip("/"),
+        args.bq_project,
         args.bq_source_dataset,
         args.bq_view_dataset,
         args.materialize_export_table,
@@ -393,6 +394,7 @@ def main() -> None:
         options=args.options,
         steps=steps,
         source_project=args.source_project,
+        bq_project=args.bq_project,
         gcs_bucket=args.gcs_bucket,
         gcs_prefix=args.gcs_prefix,
         bq_location=args.bq_location,
