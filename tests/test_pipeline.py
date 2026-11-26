@@ -162,7 +162,7 @@ class MediaWikiPipelineTests(unittest.TestCase):
     def test_orchestrator_recentchanges_and_empty_gcs_prefix(self) -> None:
         self.assertEqual(DEFAULT_SOURCE_PROJECT, "prj-c9ec-ing-ds-dev-ec")
         self.assertEqual(DEFAULT_BQ_PROJECT, "prj-c9ec-data-dom-dev-ec")
-        self.assertEqual(DEFAULT_BQ_LOCATION, "europe-west4")
+        self.assertEqual(DEFAULT_BQ_LOCATION, "EU")
         self.assertEqual(DEFAULT_GCS_BUCKET, "mediawiki-data-nov-25")
         self.assertEqual(DEFAULT_BQ_SOURCE_DATASET, "aow_nov_26")
         self.assertEqual(DEFAULT_BQ_VIEW_DATASET, "wiki_vertex_authorized")

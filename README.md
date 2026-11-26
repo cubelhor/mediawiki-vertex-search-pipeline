@@ -95,15 +95,17 @@ python3 5_vertex_import_jsonl.py \
 | Layer | GCP Project | Resources |
 | :--- | :--- | :--- |
 | **1. Ingestion (`ing-dev`)** | `prj-c9ec-ing-ds-dev-ec` (`#21248470869`) | Cloud Run Job (`mediawiki-vertex-sync`, `europe-west4`), GCS bucket (`gs://mediawiki-data-nov-25`), Secret Manager, Cloud Scheduler |
-| **2. Data Domain (`data-dom`)** | `prj-c9ec-data-dom-dev-ec` | BigQuery (`europe-west4`) base tables (`aow_nov_26`) & Authorized Views + export tables (`wiki_vertex_authorized`) |
+| **2. Data Domain (`data-dom`)** | `prj-c9ec-data-dom-dev-ec` | BigQuery (`EU`) base tables (`aow_nov_26`) & Authorized Views + export tables (`wiki_vertex_authorized`) |
 | **3. Consumer (`everyday-dev`)** | `prj-7efd-everydai-dev-4f9a` (`#7016082038`) | Vertex AI Search datastores (`gemini-enterprise-wiki-raw`, `gemini-enterprise-wiki-chunked`, `eu`) |
 
 - **`project-service-account@prj-c9ec-ing-ds-dev-ec.iam.gserviceaccount.com`** needs:
   - On `prj-c9ec-ing-ds-dev-ec`: `roles/storage.objectAdmin` (`gs://mediawiki-data-nov-25`), `roles/run.invoker`, `roles/secretmanager.secretAccessor`
   - On `prj-c9ec-data-dom-dev-ec`: `roles/bigquery.dataOwner`, `roles/bigquery.jobUser`
-  - On `prj-7efd-everydai-dev-4f9a`: `roles/discoveryengine.admin`
+  - On `prj-7efd-everydai-dev-4f9a`: `roles/discoveryengine.editor` *(or `roles/discoveryengine.admin`)*
 - **`service-7016082038@gcp-sa-discoveryengine.iam.gserviceaccount.com`** needs:
   - On `prj-c9ec-data-dom-dev-ec`: `roles/bigquery.dataViewer` (**dataset `wiki_vertex_authorized` ONLY**), `roles/bigquery.jobUser`, `roles/bigquery.readSessionUser`
+
+> **Cybersecurity Review Package**: High-resolution network/firewall and authentication diagrams plus security control tables are in `cybersecurity_diagrams/` (`CYBERSECURITY_ARCHITECTURE.md`, `diagram_1_network_and_data_flows.png/.svg`, `diagram_2_auth_and_security_sequence.png/.svg`).
 
 > **Note on Authorized Views vs. Materialized Export Tables**: Discovery Engine bulk ingestion (`BigQuerySource`) prohibits External Tables over GCS and can reject logical SQL Views during table extract jobs. Running with `--materialize-export-table` (enabled by default in `run_pipeline.py`) creates **both** the Authorized Views (`v_wiki_option1_raw_templates`, `v_wiki_option2_manual_chunks`) and physical export tables (`t_wiki_option1_raw_templates_export`, `t_wiki_option2_manual_chunks_export`) inside `prj-c9ec-data-dom-dev-ec.wiki_vertex_authorized`.
 
