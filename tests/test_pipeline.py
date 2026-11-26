@@ -162,7 +162,7 @@ class MediaWikiPipelineTests(unittest.TestCase):
         self.assertEqual(DEFAULT_SOURCE_PROJECT, "prj-c9ec-ing-ds-dev-ec")
         self.assertEqual(DEFAULT_BQ_PROJECT, "prj-c9ec-data-dom-dev-ec")
         self.assertEqual(DEFAULT_GCS_BUCKET, "mediawiki-data-nov-25")
-        self.assertEqual(DEFAULT_BQ_SOURCE_DATASET, "wiki_raw_internal")
+        self.assertEqual(DEFAULT_BQ_SOURCE_DATASET, "aow_nov_26")
         self.assertEqual(DEFAULT_BQ_VIEW_DATASET, "wiki_vertex_authorized")
         self.assertEqual(DEFAULT_VERTEX_PROJECT, "prj-7efd-everydai-dev-4f9a")
         self.assertEqual(DEFAULT_VERTEX_PROJECT_NUMBER, "7016082038")
@@ -173,7 +173,7 @@ class MediaWikiPipelineTests(unittest.TestCase):
         view_sql = _step5.build_authorized_view_sql(
             parsed.bq_project, parsed.bq_source_dataset, "wiki_option1_raw_templates"
         )
-        self.assertIn("`prj-c9ec-data-dom-dev-ec.wiki_raw_internal.wiki_option1_raw_templates`", view_sql)
+        self.assertIn("`prj-c9ec-data-dom-dev-ec.aow_nov_26.wiki_option1_raw_templates`", view_sql)
 
         specs = _step5.build_option_specs("", "raw-ds", "chunk-ds")
         self.assertEqual(specs[0].gcs_bq_blob, "option1_raw/raw_with_templates_bq.jsonl")
