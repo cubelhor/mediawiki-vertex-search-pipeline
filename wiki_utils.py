@@ -51,7 +51,7 @@ DEFAULT_GCS_PREFIX = os.environ.get("WIKI_GCS_PREFIX", "")
 
 # Project 2 — Data Domain BigQuery native base tables & Authorized Views (`data-dom`)
 DEFAULT_BQ_PROJECT = os.environ.get("BQ_GCP_PROJECT", "prj-c9ec-data-dom-dev-ec")
-DEFAULT_BQ_LOCATION = os.environ.get("BQ_LOCATION", "EU")
+DEFAULT_BQ_LOCATION = os.environ.get("BQ_LOCATION", "europe-west4")
 DEFAULT_BQ_SOURCE_DATASET = os.environ.get("BQ_SOURCE_DATASET", "aow_nov_26")
 DEFAULT_BQ_VIEW_DATASET = os.environ.get("BQ_AUTHORIZED_VIEW_DATASET", "wiki_vertex_authorized")
 

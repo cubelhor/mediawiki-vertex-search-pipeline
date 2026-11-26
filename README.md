@@ -95,7 +95,7 @@ python3 5_vertex_import_jsonl.py \
 | Layer | GCP Project | Resources |
 | :--- | :--- | :--- |
 | **1. Ingestion (`ing-dev`)** | `prj-c9ec-ing-ds-dev-ec` (`#21248470869`) | Cloud Run Job (`mediawiki-vertex-sync`, `europe-west4`), GCS bucket (`gs://mediawiki-data-nov-25`), Secret Manager, Cloud Scheduler |
-| **2. Data Domain (`data-dom`)** | `prj-c9ec-data-dom-dev-ec` | BigQuery base tables (`aow_nov_26`) & Authorized Views + export tables (`wiki_vertex_authorized`) |
+| **2. Data Domain (`data-dom`)** | `prj-c9ec-data-dom-dev-ec` | BigQuery (`europe-west4`) base tables (`aow_nov_26`) & Authorized Views + export tables (`wiki_vertex_authorized`) |
 | **3. Consumer (`everyday-dev`)** | `prj-7efd-everydai-dev-4f9a` (`#7016082038`) | Vertex AI Search datastores (`gemini-enterprise-wiki-raw`, `gemini-enterprise-wiki-chunked`, `eu`) |
 
 - **`project-service-account@prj-c9ec-ing-ds-dev-ec.iam.gserviceaccount.com`** needs:
