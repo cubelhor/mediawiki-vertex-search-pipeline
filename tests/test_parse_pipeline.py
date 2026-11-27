@@ -86,6 +86,43 @@ class ActionParsePipelineTests(unittest.TestCase):
         self.assertIn('href="https://example.com/doc"', doc)
         self.assertIn("Safe content", doc)
 
+    def test_redirect_alias_discovery_avoids_generator_redirects_conflict(self) -> None:
+        sess = MagicMock()
+        sess.trust_env = True
+        sess.get.side_effect = [
+            _mock_resp(
+                {
+                    "query": {
+                        "allpages": [
+                            {"pageid": 10, "ns": 0, "title": "Acronyms"},
+                            {"pageid": 11, "ns": 0, "title": "WinCVS"},
+                        ]
+                    }
+                }
+            ),
+            _mock_resp(
+                {
+                    "query": {
+                        "redirects": [
+                            {"from": "Acronyms", "to": "Abbreviations"},
+                            {"from": "WinCVS", "to": "CVS"},
+                        ]
+                    }
+                }
+            ),
+        ]
+        aliases = crawl_parse_html._discover_redirect_aliases(
+            sess, "https://aow.eu.airbus.corp/api.php", [(0, "Main")]
+        )
+        self.assertEqual(aliases[crawl_parse_html.mw_canonical_title_key("Abbreviations")], ["Acronyms"])
+        self.assertEqual(aliases[crawl_parse_html.mw_canonical_title_key("CVS")], ["WinCVS"])
+        for call in sess.get.call_args_list:
+            params = call.kwargs.get("params") or {}
+            self.assertFalse(
+                params.get("generator") == "allpages" and "redirects" in params,
+                f"Invalid MediaWiki param combo detected: {params}",
+            )
+
     def test_crawl_parse_incremental_cache_and_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "parsed_html"

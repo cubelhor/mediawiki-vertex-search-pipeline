@@ -231,22 +231,21 @@ def _discover_redirect_aliases(
     ns_list: Sequence[Tuple[int, str]],
     maxlag: int = 15,
 ) -> Dict[str, List[str]]:
-    """Query all redirect pages across namespaces and return `{canonical_target_key: [alias_titles]}`."""
-    aliases_by_target: Dict[str, List[str]] = {}
+    """List redirect pages via `list=allpages` and resolve their canonical targets in 50-title batches (`redirects=1`)."""
+    redirect_titles: List[str] = []
     for ns_id, ns_name in ns_list:
-        params: Dict[str, str] = {
+        base_params: Dict[str, str] = {
             "action": "query",
-            "generator": "allpages",
-            "gapnamespace": str(ns_id),
-            "gapfilterredir": "redirects",
-            "gaplimit": "500",
-            "redirects": "1",
-            "prop": "info",
+            "list": "allpages",
+            "apnamespace": str(ns_id),
+            "apfilterredir": "redirects",
+            "aplimit": "500",
             "continue": "",
             "maxlag": str(maxlag),
             "format": "json",
             "formatversion": "2",
         }
+        params = dict(base_params)
         seen_sigs: Set[Tuple[Tuple[str, str], ...]] = set()
         while True:
             sig = tuple(sorted(params.items()))
@@ -260,7 +259,7 @@ def _discover_redirect_aliases(
                     params=params,
                     method="GET",
                     timeout=REQUEST_TIMEOUT_SECONDS,
-                    context=f"MediaWiki redirect discovery (ns={ns_id}:{ns_name})",
+                    context=f"MediaWiki redirect list (ns={ns_id}:{ns_name})",
                 )
             except RuntimeError as exc:
                 if ns_id != 0 and any(
@@ -269,20 +268,45 @@ def _discover_redirect_aliases(
                     break
                 raise
 
-            for redir in data.get("query", {}).get("redirects", []):
-                src = strip_invisible_chars(str(redir.get("from") or "")).strip()
-                dst = strip_invisible_chars(str(redir.get("to") or "")).strip()
-                if not src or not dst:
-                    continue
-                src_key = mw_canonical_title_key(src)
-                dst_key = mw_canonical_title_key(dst)
-                if src_key and dst_key and src_key != dst_key:
-                    aliases_by_target.setdefault(dst_key, []).append(src)
+            for item in data.get("query", {}).get("allpages", []):
+                title = strip_invisible_chars(str(item.get("title") or "")).strip()
+                if title:
+                    redirect_titles.append(title)
 
             cont = data.get("continue")
             if not cont:
                 break
-            params = {**params, **{k: str(v) for k, v in cont.items()}}
+            params = {**base_params, **{k: str(v) for k, v in cont.items()}}
+
+    # Resolve redirect targets in batches of 50 via `titles=...&redirects=1` (never combined with `generator=allpages`)
+    unique_redirs = merge_unique_strings(redirect_titles)
+    aliases_by_target: Dict[str, List[str]] = {}
+    for start in range(0, len(unique_redirs), 50):
+        batch = unique_redirs[start : start + 50]
+        data = mw_api_request(
+            session,
+            api_url,
+            params={
+                "action": "query",
+                "titles": "|".join(batch),
+                "redirects": "1",
+                "maxlag": str(maxlag),
+                "format": "json",
+                "formatversion": "2",
+            },
+            method="GET",
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            context=f"MediaWiki redirect resolution (batch {start // 50 + 1})",
+        )
+        for redir in data.get("query", {}).get("redirects", []):
+            src = strip_invisible_chars(str(redir.get("from") or "")).strip()
+            dst = strip_invisible_chars(str(redir.get("to") or "")).strip()
+            if not src or not dst:
+                continue
+            src_key = mw_canonical_title_key(src)
+            dst_key = mw_canonical_title_key(dst)
+            if src_key and dst_key and src_key != dst_key:
+                aliases_by_target.setdefault(dst_key, []).append(src)
 
     return {k: merge_unique_strings(v) for k, v in aliases_by_target.items()}
 
