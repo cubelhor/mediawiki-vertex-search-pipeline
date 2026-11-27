@@ -35,7 +35,10 @@ for _venv_candidate in (
     if _venv_candidate.exists() and str(_venv_candidate) not in sys.path:
         sys.path.append(str(_venv_candidate))
 
-import mwparserfromhell  # noqa: E402
+try:
+    import mwparserfromhell  # noqa: E402
+except ImportError:  # pragma: no cover - optional for action=parse HTML pipeline
+    mwparserfromhell = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Shared MediaWiki & Cloud Configuration Defaults (Single Source of Truth)
@@ -61,6 +64,12 @@ DEFAULT_VERTEX_PROJECT_NUMBER = os.environ.get("TARGET_VERTEX_PROJECT_NUMBER", "
 DEFAULT_VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "eu")
 DEFAULT_RAW_DATASTORE_ID = os.environ.get("VERTEX_RAW_DATASTORE_ID", "gemini-enterprise-wiki-raw")
 DEFAULT_CHUNKED_DATASTORE_ID = os.environ.get("VERTEX_CHUNKED_DATASTORE_ID", "gemini-enterprise-wiki-chunked")
+DEFAULT_HTML_NATIVE_DATASTORE_ID = os.environ.get(
+    "VERTEX_HTML_NATIVE_DATASTORE_ID", "gemini-enterprise-wiki-html-native"
+)
+DEFAULT_HTML_CHUNKED_DATASTORE_ID = os.environ.get(
+    "VERTEX_HTML_CHUNKED_DATASTORE_ID", "gemini-enterprise-wiki-html-chunked"
+)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -752,7 +761,7 @@ def detect_redirect(wikitext: str) -> Tuple[bool, Optional[str]]:
 
 def extract_transclusion_references(wikitext: str) -> Tuple[List[str], List[str]]:
     """Extract `(template_norm_keys, explicit_page_transclusions)` referenced in a page's wikitext."""
-    if not wikitext:
+    if not wikitext or mwparserfromhell is None:
         return [], []
     try:
         parsed = mwparserfromhell.parse(wikitext)

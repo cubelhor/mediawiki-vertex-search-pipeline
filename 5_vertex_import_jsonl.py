@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from wiki_utils import (
     DEFAULT_BQ_LOCATION,
@@ -16,6 +17,8 @@ from wiki_utils import (
     DEFAULT_CHUNKED_DATASTORE_ID,
     DEFAULT_GCS_BUCKET,
     DEFAULT_GCS_PREFIX,
+    DEFAULT_HTML_CHUNKED_DATASTORE_ID,
+    DEFAULT_HTML_NATIVE_DATASTORE_ID,
     DEFAULT_RAW_DATASTORE_ID,
     DEFAULT_SOURCE_PROJECT,
     DEFAULT_VERTEX_LOCATION,
@@ -45,6 +48,11 @@ class PipelineOptionSpec:
     bq_export_table: str
     datastore_id: str
     datastore_display_name: str
+    is_unstructured_html: bool = False
+    local_html_pages_dir: Optional[Path] = None
+    local_incremental_doc_jsonl: Optional[Path] = None
+    gcs_html_pages_prefix: str = ""
+    gcs_incremental_doc_blob: str = ""
 
 
 def validate_gcp_project_id(project_id: str) -> str:
@@ -70,9 +78,13 @@ def build_option_specs(
     gcs_prefix: str,
     raw_datastore_id: str,
     chunked_datastore_id: str,
+    html_native_datastore_id: str = DEFAULT_HTML_NATIVE_DATASTORE_ID,
+    html_chunked_datastore_id: str = DEFAULT_HTML_CHUNKED_DATASTORE_ID,
+    parsed_html_dir: Optional[Path] = None,
 ) -> List[PipelineOptionSpec]:
     prefix = gcs_prefix.strip("/")
     prefix_part = f"{prefix}/" if prefix else ""
+    html_root = parsed_html_dir or (ROOT / "wikimedia-data" / "parsed_html")
     return [
         PipelineOptionSpec(
             key="raw",
@@ -99,6 +111,37 @@ def build_option_specs(
             bq_export_table="t_wiki_option2_manual_chunks_export",
             datastore_id=chunked_datastore_id,
             datastore_display_name="Airbus Wiki - Option 2 (Manual Chunks)",
+        ),
+        PipelineOptionSpec(
+            key="html_native",
+            label="Option 1 HTML (action=parse Rendered HTML + Vertex Layout Parser & Auto-Chunker via GCS)",
+            local_bq_jsonl=html_root / "metadata.jsonl",
+            local_gcs_doc_jsonl=html_root / "metadata.jsonl",
+            gcs_bq_blob=f"{prefix_part}option1_html/metadata.jsonl",
+            gcs_doc_blob=f"{prefix_part}option1_html/metadata.jsonl",
+            bq_source_table="",
+            bq_authorized_view="",
+            bq_export_table="",
+            datastore_id=html_native_datastore_id,
+            datastore_display_name="Airbus Wiki - Option 1 HTML (Vertex Layout Parser)",
+            is_unstructured_html=True,
+            local_html_pages_dir=html_root / "pages",
+            local_incremental_doc_jsonl=html_root / "metadata_incremental.jsonl",
+            gcs_html_pages_prefix=f"{prefix_part}option1_html/pages",
+            gcs_incremental_doc_blob=f"{prefix_part}option1_html/metadata_incremental.jsonl",
+        ),
+        PipelineOptionSpec(
+            key="html_chunked",
+            label="Option 2 HTML (action=parse HTML -> Clean Markdown Manual Chunks via BigQuery)",
+            local_bq_jsonl=html_root / "chunks_bq.jsonl",
+            local_gcs_doc_jsonl=html_root / "chunks-for-vertexai.jsonl",
+            gcs_bq_blob=f"{prefix_part}option2_html_chunked/chunks_bq.jsonl",
+            gcs_doc_blob=f"{prefix_part}option2_html_chunked/chunks-for-vertexai.jsonl",
+            bq_source_table="wiki_option2_html_chunks",
+            bq_authorized_view="v_wiki_option2_html_chunks",
+            bq_export_table="t_wiki_option2_html_chunks_export",
+            datastore_id=html_chunked_datastore_id,
+            datastore_display_name="Airbus Wiki - Option 2 HTML (Manual Chunks)",
         ),
     ]
 
@@ -149,11 +192,65 @@ def upload_option_files_to_gcs(
     import_source: str = "bq",
     upload_all_variants: bool = False,
     dry_run: bool = False,
+    upload_workers: int = 8,
 ) -> None:
     proj = validate_gcp_project_id(source_project)
     bucket_clean = validate_gcs_bucket(bucket_name)
 
     for spec in specs:
+        if spec.is_unstructured_html:
+            pages_dir = spec.local_html_pages_dir
+            if pages_dir is None or not pages_dir.is_dir():
+                raise FileNotFoundError(f"Missing parsed HTML pages directory: {pages_dir}")
+            if not spec.local_gcs_doc_jsonl.is_file():
+                raise FileNotFoundError(f"Missing Option 1 HTML metadata JSONL: {spec.local_gcs_doc_jsonl}")
+
+            html_files = sorted(pages_dir.glob("*.html"))
+            manifest_targets = [(spec.local_gcs_doc_jsonl, spec.gcs_doc_blob)]
+            if (
+                spec.local_incremental_doc_jsonl
+                and spec.local_incremental_doc_jsonl.is_file()
+                and spec.gcs_incremental_doc_blob
+            ):
+                manifest_targets.append((spec.local_incremental_doc_jsonl, spec.gcs_incremental_doc_blob))
+
+            if dry_run:
+                logger.info(
+                    "[DRY-RUN] Would upload %d .html file(s) -> gs://%s/%s/ and %d manifest JSONL(s)",
+                    len(html_files),
+                    bucket_clean,
+                    spec.gcs_html_pages_prefix,
+                    len(manifest_targets),
+                )
+                continue
+
+            from google.cloud import storage
+
+            client = storage.Client(project=proj)
+            bucket = client.bucket(bucket_clean)
+            safe_workers = max(1, min(int(upload_workers), 16))
+            pages_prefix = spec.gcs_html_pages_prefix.strip("/")
+
+            def _upload_one_html(local_html: Path) -> None:
+                blob = bucket.blob(f"{pages_prefix}/{local_html.name}")
+                blob.upload_from_filename(str(local_html), content_type="text/html; charset=utf-8")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=safe_workers) as pool:
+                list(pool.map(_upload_one_html, html_files))
+
+            for local_manifest, blob_name in manifest_targets:
+                bucket.blob(blob_name).upload_from_filename(
+                    str(local_manifest), content_type="application/jsonl; charset=utf-8"
+                )
+                logger.info("Uploaded %s -> gs://%s/%s", local_manifest.name, bucket_clean, blob_name)
+            logger.info(
+                "Uploaded %d HTML page(s) -> gs://%s/%s/",
+                len(html_files),
+                bucket_clean,
+                pages_prefix,
+            )
+            continue
+
         targets = [(spec.local_bq_jsonl, spec.gcs_bq_blob)]
         if import_source == "gcs" or upload_all_variants:
             targets.append((spec.local_gcs_doc_jsonl, spec.gcs_doc_blob))
@@ -190,6 +287,12 @@ def setup_bigquery_tables_and_authorized_views(
     view_ds_name = validate_bq_identifier(view_dataset_id)
 
     for spec in specs:
+        if spec.is_unstructured_html:
+            logger.info(
+                "Skipping BigQuery setup for %s (unstructured GCS CONTENT_REQUIRED datastore).",
+                spec.key,
+            )
+            continue
         src_tbl = validate_bq_identifier(spec.bq_source_table)
         view_name = validate_bq_identifier(spec.bq_authorized_view)
         exp_tbl = validate_bq_identifier(spec.bq_export_table)
@@ -279,11 +382,44 @@ def _get_discovery_client_options(location: str):
     return None
 
 
+def build_unstructured_html_datastore_config(
+    display_name: str,
+    chunk_size: int = 500,
+    include_ancestor_headings: bool = True,
+):
+    """Build a Discovery Engine `DataStore` proto for Unstructured HTML (`CONTENT_REQUIRED` + Layout Parser + Auto-Chunking)."""
+    from google.cloud import discoveryengine_v1 as v1
+
+    bounded_chunk_size = max(100, min(int(chunk_size), 500))
+    return v1.DataStore(
+        display_name=display_name,
+        industry_vertical=v1.IndustryVertical.GENERIC,
+        solution_types=[v1.SolutionType.SOLUTION_TYPE_SEARCH],
+        content_config=v1.DataStore.ContentConfig.CONTENT_REQUIRED,
+        document_processing_config=v1.DocumentProcessingConfig(
+            default_parsing_config=v1.DocumentProcessingConfig.ParsingConfig(
+                layout_parsing_config=v1.DocumentProcessingConfig.ParsingConfig.LayoutParsingConfig(
+                    exclude_html_classes=["navbox", "navbox-inner", "mw-editsection", "toc", "noprint", "catlinks"],
+                    exclude_html_elements=["script", "style", "noscript"],
+                )
+            ),
+            chunking_config=v1.DocumentProcessingConfig.ChunkingConfig(
+                layout_based_chunking_config=v1.DocumentProcessingConfig.ChunkingConfig.LayoutBasedChunkingConfig(
+                    chunk_size=bounded_chunk_size,
+                    include_ancestor_headings=bool(include_ancestor_headings),
+                )
+            ),
+        ),
+    )
+
+
 def ensure_datastore(
     vertex_project: str,
     vertex_location: str,
     datastore_id: str,
     display_name: str,
+    is_unstructured_html: bool = False,
+    chunk_size: int = 500,
 ) -> str:
     from google.api_core.exceptions import NotFound
     from google.cloud import discoveryengine_v1 as v1
@@ -299,11 +435,19 @@ def ensure_datastore(
     except NotFound:
         pass
 
-    datastore = v1.DataStore(
-        display_name=display_name,
-        industry_vertical=v1.IndustryVertical.GENERIC,
-        solution_types=[v1.SolutionType.SOLUTION_TYPE_SEARCH],
-    )
+    if is_unstructured_html:
+        datastore = build_unstructured_html_datastore_config(
+            display_name=display_name,
+            chunk_size=chunk_size,
+            include_ancestor_headings=True,
+        )
+    else:
+        datastore = v1.DataStore(
+            display_name=display_name,
+            industry_vertical=v1.IndustryVertical.GENERIC,
+            solution_types=[v1.SolutionType.SOLUTION_TYPE_SEARCH],
+        )
+
     request = v1.CreateDataStoreRequest(
         parent=parent,
         data_store_id=datastore_id,
@@ -311,7 +455,7 @@ def ensure_datastore(
     )
     operation = client.create_data_store(request=request)
     result = operation.result(timeout=600)
-    logger.info("Created datastore: %s", result.name)
+    logger.info("Created datastore: %s (unstructured_html=%s)", result.name, is_unstructured_html)
     return result.name
 
 
@@ -324,6 +468,9 @@ def import_into_vertex_datastores(
     specs: Sequence[PipelineOptionSpec],
     import_source: str = "bq",
     use_materialized_table: bool = False,
+    reconciliation_mode: str = "auto",
+    use_incremental_manifest: bool = False,
+    html_chunk_size: int = 500,
     dry_run: bool = False,
 ) -> None:
     src_proj = validate_gcp_project_id(bq_project)
@@ -332,6 +479,80 @@ def import_into_vertex_datastores(
     view_ds_name = validate_bq_identifier(view_dataset_id)
 
     for spec in specs:
+        effective_mode = reconciliation_mode.lower()
+        if effective_mode == "auto":
+            # Default to INCREMENTAL on Layout Parser HTML datastores to prevent daily full re-parse fees!
+            effective_mode = "incremental" if spec.is_unstructured_html else "full"
+
+        if spec.is_unstructured_html:
+            if (
+                use_incremental_manifest
+                and effective_mode == "incremental"
+                and spec.local_incremental_doc_jsonl
+                and spec.local_incremental_doc_jsonl.is_file()
+                and spec.gcs_incremental_doc_blob
+            ):
+                if spec.local_incremental_doc_jsonl.stat().st_size == 0:
+                    logger.info(
+                        "0 changed HTML documents in %s; skipping Vertex Layout Parser import for %s.",
+                        spec.local_incremental_doc_jsonl.name,
+                        spec.datastore_id,
+                    )
+                    continue
+                manifest_blob = spec.gcs_incremental_doc_blob
+            else:
+                manifest_blob = spec.gcs_doc_blob
+            gcs_doc_uri = f"gs://{bucket_clean}/{manifest_blob}"
+            if dry_run:
+                logger.info("[DRY-RUN] Vertex AI Search Unstructured HTML import for %s:", spec.label)
+                logger.info(
+                    "  Target datastore: projects/%s/locations/%s/collections/default_collection/dataStores/%s "
+                    "(CONTENT_REQUIRED + LayoutParser + LayoutBasedChunkingConfig(chunk_size=%d, include_ancestor_headings=True))",
+                    dst_proj,
+                    vertex_location,
+                    spec.datastore_id,
+                    html_chunk_size,
+                )
+                logger.info(
+                    "  Source: GcsSource(input_uris=[%r], data_schema='document'), mode=%s",
+                    gcs_doc_uri,
+                    effective_mode.upper(),
+                )
+                continue
+
+            from google.cloud import discoveryengine_v1 as v1
+
+            ensure_datastore(
+                vertex_project=dst_proj,
+                vertex_location=vertex_location,
+                datastore_id=spec.datastore_id,
+                display_name=spec.datastore_display_name,
+                is_unstructured_html=True,
+                chunk_size=html_chunk_size,
+            )
+            doc_client = v1.DocumentServiceClient(client_options=_get_discovery_client_options(vertex_location))
+            branch_parent = doc_client.branch_path(
+                project=dst_proj,
+                location=vertex_location,
+                data_store=spec.datastore_id,
+                branch="0",
+            )
+            rec_enum = (
+                v1.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+                if effective_mode == "incremental"
+                else v1.ImportDocumentsRequest.ReconciliationMode.FULL
+            )
+            req = v1.ImportDocumentsRequest(
+                parent=branch_parent,
+                gcs_source=v1.GcsSource(input_uris=[gcs_doc_uri], data_schema="document"),
+                reconciliation_mode=rec_enum,
+            )
+            operation = doc_client.import_documents(request=req)
+            logger.info("Started Vertex HTML import operation for %s: %s", spec.datastore_id, operation.operation.name)
+            result = operation.result(timeout=1800)
+            logger.info("Completed Vertex HTML import for %s: %s", spec.datastore_id, result)
+            continue
+
         bq_target_obj = validate_bq_identifier(
             spec.bq_export_table if use_materialized_table else spec.bq_authorized_view
         )
@@ -347,13 +568,18 @@ def import_into_vertex_datastores(
             )
             if import_source == "bq":
                 logger.info(
-                    "  Source: BigQuerySource(project_id=%r, dataset_id=%r, table_id=%r, data_schema='custom'), id_field='id', mode=FULL",
+                    "  Source: BigQuerySource(project_id=%r, dataset_id=%r, table_id=%r, data_schema='custom'), id_field='id', mode=%s",
                     src_proj,
                     view_ds_name,
                     bq_target_obj,
+                    effective_mode.upper(),
                 )
             else:
-                logger.info("  Source: GcsSource(input_uris=[%r], data_schema='document'), mode=FULL", gcs_doc_uri)
+                logger.info(
+                    "  Source: GcsSource(input_uris=[%r], data_schema='document'), mode=%s",
+                    gcs_doc_uri,
+                    effective_mode.upper(),
+                )
             continue
 
         from google.cloud import discoveryengine_v1 as v1
@@ -363,6 +589,7 @@ def import_into_vertex_datastores(
             vertex_location=vertex_location,
             datastore_id=spec.datastore_id,
             display_name=spec.datastore_display_name,
+            is_unstructured_html=False,
         )
         doc_client = v1.DocumentServiceClient(client_options=_get_discovery_client_options(vertex_location))
         branch_parent = doc_client.branch_path(
@@ -370,6 +597,11 @@ def import_into_vertex_datastores(
             location=vertex_location,
             data_store=spec.datastore_id,
             branch="0",
+        )
+        rec_enum = (
+            v1.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+            if effective_mode == "incremental"
+            else v1.ImportDocumentsRequest.ReconciliationMode.FULL
         )
 
         if import_source == "bq":
@@ -383,13 +615,13 @@ def import_into_vertex_datastores(
                 ),
                 id_field="id",
                 auto_generate_ids=False,
-                reconciliation_mode=v1.ImportDocumentsRequest.ReconciliationMode.FULL,
+                reconciliation_mode=rec_enum,
             )
         else:
             req = v1.ImportDocumentsRequest(
                 parent=branch_parent,
                 gcs_source=v1.GcsSource(input_uris=[gcs_doc_uri], data_schema="document"),
-                reconciliation_mode=v1.ImportDocumentsRequest.ReconciliationMode.FULL,
+                reconciliation_mode=rec_enum,
             )
 
         operation = doc_client.import_documents(request=req)
@@ -402,6 +634,8 @@ def print_cross_project_iam_hint(
     bq_project: str,
     view_dataset_id: str,
     target_vertex_project_number: str,
+    gcs_bucket: str = DEFAULT_GCS_BUCKET,
+    include_gcs_hint: bool = False,
 ) -> None:
     proj_num = target_vertex_project_number or "<TARGET_VERTEX_PROJECT_NUMBER>"
     sa = f"service-{proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com"
@@ -413,6 +647,13 @@ def print_cross_project_iam_hint(
         view_dataset_id,
         bq_project,
     )
+    if include_gcs_hint:
+        logger.info(
+            "Cross-Project GCS IAM Checklist (for Option 1 Unstructured HTML): "
+            "grant `roles/storage.objectViewer` on `gs://%s` to `%s`.",
+            gcs_bucket,
+            sa,
+        )
 
 
 def add_common_cloud_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -460,6 +701,25 @@ def add_common_cloud_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vertex-location", default=DEFAULT_VERTEX_LOCATION, help="Vertex AI Search location (default: %(default)s).")
     parser.add_argument("--raw-datastore-id", default=DEFAULT_RAW_DATASTORE_ID)
     parser.add_argument("--chunked-datastore-id", default=DEFAULT_CHUNKED_DATASTORE_ID)
+    parser.add_argument("--html-native-datastore-id", default=DEFAULT_HTML_NATIVE_DATASTORE_ID)
+    parser.add_argument("--html-chunked-datastore-id", default=DEFAULT_HTML_CHUNKED_DATASTORE_ID)
+    parser.add_argument(
+        "--reconciliation-mode",
+        choices=["auto", "incremental", "full"],
+        default="auto",
+        help="Vertex import reconciliation mode (`auto` = INCREMENTAL for html_native Layout Parser, FULL for BQ tables).",
+    )
+    parser.add_argument(
+        "--use-incremental-manifest",
+        action="store_true",
+        help="For `html_native` incremental imports, use `metadata_incremental.jsonl` (only changed pages) when non-empty.",
+    )
+    parser.add_argument(
+        "--html-chunk-size",
+        type=int,
+        default=500,
+        help="Target token chunk size (100..500) for Vertex LayoutBasedChunkingConfig on `html_native` (default: 500).",
+    )
 
 
 def run_cloud_deployment(
@@ -477,9 +737,15 @@ def run_cloud_deployment(
     vertex_location: str = DEFAULT_VERTEX_LOCATION,
     raw_datastore_id: str = DEFAULT_RAW_DATASTORE_ID,
     chunked_datastore_id: str = DEFAULT_CHUNKED_DATASTORE_ID,
+    html_native_datastore_id: str = DEFAULT_HTML_NATIVE_DATASTORE_ID,
+    html_chunked_datastore_id: str = DEFAULT_HTML_CHUNKED_DATASTORE_ID,
+    parsed_html_dir: Optional[Path] = None,
     import_source: str = "bq",
     materialize_export_table: bool = False,
     upload_all_variants: bool = False,
+    reconciliation_mode: str = "auto",
+    use_incremental_manifest: bool = False,
+    html_chunk_size: int = 500,
     dry_run: bool = False,
 ) -> None:
     """Execute GCS upload (ing-dev), BigQuery tables + Authorized Views (data-dom), and Vertex imports (everyday-dev)."""
@@ -487,8 +753,12 @@ def run_cloud_deployment(
         gcs_prefix=gcs_prefix,
         raw_datastore_id=raw_datastore_id,
         chunked_datastore_id=chunked_datastore_id,
+        html_native_datastore_id=html_native_datastore_id,
+        html_chunked_datastore_id=html_chunked_datastore_id,
+        parsed_html_dir=parsed_html_dir,
     )
     selected_specs = [s for s in all_specs if s.key in set(options)]
+    has_html_native = any(s.is_unstructured_html for s in selected_specs)
 
     if "upload-gcs" in steps:
         upload_option_files_to_gcs(
@@ -515,6 +785,8 @@ def run_cloud_deployment(
             bq_project=bq_project,
             view_dataset_id=bq_view_dataset,
             target_vertex_project_number=vertex_project_number,
+            gcs_bucket=gcs_bucket,
+            include_gcs_hint=has_html_native,
         )
 
     if "import-vertex" in steps:
@@ -527,20 +799,23 @@ def run_cloud_deployment(
             specs=selected_specs,
             import_source=import_source,
             use_materialized_table=materialize_export_table,
+            reconciliation_mode=reconciliation_mode,
+            use_incremental_manifest=use_incremental_manifest,
+            html_chunk_size=html_chunk_size,
             dry_run=dry_run,
         )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload Option 1 & Option 2 JSONLs to GCS, build BigQuery Authorized Views, and import into Vertex Search."
+        description="Upload Option 1 & Option 2 datasets to GCS, build BigQuery Authorized Views, and import into Vertex Search."
     )
     parser.add_argument(
         "--options",
         nargs="+",
-        choices=["raw", "chunked"],
+        choices=["raw", "chunked", "html_native", "html_chunked"],
         default=["raw", "chunked"],
-        help="Which pipeline dataset(s) to deploy (default: both raw and chunked).",
+        help="Which pipeline dataset(s) to deploy (`raw`, `chunked`, `html_native`, `html_chunked`).",
     )
     parser.add_argument(
         "--steps",
@@ -548,6 +823,12 @@ def main() -> None:
         choices=["upload-gcs", "setup-bq", "import-vertex"],
         default=["upload-gcs", "setup-bq", "import-vertex"],
         help="Pipeline stages to run.",
+    )
+    parser.add_argument(
+        "--parsed-html-dir",
+        type=Path,
+        default=None,
+        help="Local directory containing `pages/`, `metadata.jsonl`, and `chunks_bq.jsonl` for action=parse options.",
     )
     parser.add_argument(
         "--materialize-export-table",
@@ -573,9 +854,15 @@ def main() -> None:
         vertex_location=args.vertex_location,
         raw_datastore_id=args.raw_datastore_id,
         chunked_datastore_id=args.chunked_datastore_id,
+        html_native_datastore_id=args.html_native_datastore_id,
+        html_chunked_datastore_id=args.html_chunked_datastore_id,
+        parsed_html_dir=args.parsed_html_dir,
         import_source=args.import_source,
         materialize_export_table=args.materialize_export_table,
         upload_all_variants=args.upload_all_variants,
+        reconciliation_mode=args.reconciliation_mode,
+        use_incremental_manifest=args.use_incremental_manifest,
+        html_chunk_size=args.html_chunk_size,
         dry_run=args.dry_run,
     )
 

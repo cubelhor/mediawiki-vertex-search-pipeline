@@ -1,13 +1,45 @@
 # Airbus MediaWiki → Vertex AI Search Dual-Datastore Pipeline
 
-End-to-end ingestion, preprocessing, manual chunking, and **GCS → BigQuery (Authorized View) → Cross-Project Vertex AI Search** pipeline for comparing two retrieval architectures against a Golden Dataset:
+End-to-end ingestion, preprocessing, and **GCS / BigQuery (Authorized View) → Cross-Project Vertex AI Search** pipeline comparing two retrieval architectures against a Golden Dataset.
 
-1. **Option 1 (`gemini-enterprise-wiki-raw`)**: Full raw MediaWiki `wikitext` with inlined `referenced_templates` definitions per page + standalone `Template:*` documents + extracted `categories` and redirect `aliases`.
-2. **Option 2 (`gemini-enterprise-wiki-chunked`)**: Manual preprocessing pipeline expanding MediaWiki templates (`Actuator`, `ECM`, `DMS`, `GlossaryEntry`, `Infobox Equipment`, `EquipmentBox`, `A3Report`, callouts, etc.), converting wiki/HTML tables to Markdown pipe tables, preserving filenames/IDs/links, splitting by hierarchical section headings, and chunking at ~400 tokens with contextual headers (`Page / Aliases / Section / Categories`).
+## Unified `action=parse` HTML Pipeline *(Recommended — Branch `feat/action-parse-html`)*
+
+Uses MediaWiki's native **`action=parse`** renderer once so MediaWiki expands every template (`GlossaryEntry`, `Infobox Equipment`, `DMS`, `ECM`, `{{#switch}}`, tables) natively, feeding **both** datastores cleanly from one crawl:
+
+1. **Option 1 (`html_native` → `gemini-enterprise-wiki-html-native`):** Standalone rendered `.html` files + `metadata.jsonl` in GCS → Vertex AI Search **`CONTENT_REQUIRED` + Layout Parser + 500-token `LayoutBasedChunkingConfig` (`include_ancestor_headings=True`)**. Defaults to `INCREMENTAL` reconciliation (with `metadata_incremental.jsonl`) to avoid full daily Layout Parser re-parse fees.
+2. **Option 2 (`html_chunked` → `gemini-enterprise-wiki-html-chunked`):** Lightweight stdlib `html.parser` converts the exact same `.html` files to clean Markdown (~450-token chunks, `Page / Aliases / Section / Categories` headers, exact `#section` deep links, clean single-separator tables) → **BigQuery Authorized View (`data-dom` → `everyday-dev`)**.
+
+| Script | Stage | Description |
+| :--- | :--- | :--- |
+| `crawl_parse_html.py` | **Stage 1 (Crawl + Option 1)** | Fast `action=query` pass for page list/redirects (`aliases`) + polite concurrent `action=parse` HTML crawl with `revid` caching, active-HTML sanitization, and Option 1 GCS manifests (`metadata.jsonl` + `metadata_incremental.jsonl`). |
+| `html_to_bq_chunks.py` | **Stage 2 (Option 2)** | Zero-dependency stdlib HTML → Markdown section chunker emitting 18-column BigQuery JSONL (`chunks_bq.jsonl`) with `#section` anchor URIs. |
+| `run_parse_pipeline.py` | **Orchestrator** | Runs Stages 1–2 + drop-guard + `5_vertex_import_jsonl.py` for `html_native` and/or `html_chunked`. |
+| `tests/test_parse_pipeline.py` | **Tests** | Offline unit tests for HTML sanitization, incremental caching, table/breadcrumb chunking, and Vertex `CONTENT_REQUIRED` Layout Parser protobuf config. |
+
+### Quick Start (`action=parse` Pipeline — Windows PowerShell Safe)
+```powershell
+# 0. One-time GCS IAM grant so Vertex AI Search (everyday-dev) can read Option 1 HTML files from ing-dev:
+gcloud storage buckets add-iam-policy-binding gs://mediawiki-data-nov-25 --member="serviceAccount:service-7016082038@gcp-sa-discoveryengine.iam.gserviceaccount.com" --role="roles/storage.objectViewer" --project=prj-c9ec-ing-ds-dev-ec
+
+# 1. Fast 2-page smoke test (Abbreviations 3687 + Finance abbreviations 8159) — dry run first:
+python run_parse_pipeline.py --bypass-proxy --page-ids 3687,8159 --run-vertex-import --materialize-export-table --dry-run
+
+# 2. Live 25-page smoke test into both new datastores (gemini-enterprise-wiki-html-native & gemini-enterprise-wiki-html-chunked):
+python run_parse_pipeline.py --bypass-proxy --limit 25 --run-vertex-import --materialize-export-table
+
+# 3. Full wiki crawl (~4-6 min with 4 polite workers) + deploy both Option 1 (GCS) and Option 2 (BQ):
+python run_parse_pipeline.py --bypass-proxy --workers 4 --run-vertex-import --materialize-export-table
+
+# 4. Daily incremental refresh (only re-parses pages with new revid and only sends changed pages to Layout Parser):
+python run_parse_pipeline.py --bypass-proxy --workers 4 --run-vertex-import --use-incremental-manifest --materialize-export-table
+```
 
 ---
 
-## Pipeline Overview
+## Legacy `action=query` Wikitext Baseline *(Kept for A/B Comparison)*
+
+1. **Option 1 (`gemini-enterprise-wiki-raw`)**: Full raw MediaWiki `wikitext` with inlined `referenced_templates` definitions per page + standalone `Template:*` documents + extracted `categories` and redirect `aliases`.
+2. **Option 2 (`gemini-enterprise-wiki-chunked`)**: Manual preprocessing pipeline expanding MediaWiki templates (`Actuator`, `ECM`, `DMS`, `GlossaryEntry`, `Infobox Equipment`, `EquipmentBox`, `A3Report`, callouts, etc.), converting wiki/HTML tables to Markdown pipe tables, preserving filenames/IDs/links, splitting by hierarchical section headings, and chunking at ~400 tokens with contextual headers (`Page / Aliases / Section / Categories`).
 
 | Script | Stage | Description |
 | :--- | :--- | :--- |
@@ -18,7 +50,7 @@ End-to-end ingestion, preprocessing, manual chunking, and **GCS → BigQuery (Au
 | `2_clean_wikitext.py` | **Option 2a** | Expands templates, converts `{| wikitable |}` and HTML `<table>` infoboxes to Markdown tables, preserves code/doc filenames & URLs, converts `==` headings to `##`, and writes structured Markdown to `wikimedia-data/processed/pages/`. |
 | `3_chunk_pages.py` | **Option 2b** | Splits pages by hierarchical `##`/`###` sections, deduplicates `#REDIRECT` chains into target-page `aliases`, chunks at ~400 tokens with rolling overlap, and prepends `Page / Aliases / Section / Categories` headers. |
 | `4_generate_vertex_jsonl.py` | **Option 2c** | Exports Option 2 chunks to `chunks_bq.jsonl` (BigQuery flat schema) and `chunks-for-vertexai.jsonl` (Vertex GCS schema). |
-| `5_vertex_import_jsonl.py` | **Cloud Deploy** | Uploads Option 1 & Option 2 JSONLs to GCS, loads **native BigQuery tables**, creates & authorizes **BigQuery Authorized Views** (plus optional materialized export tables), and imports into cross-project Vertex AI Search datastores. |
+| `5_vertex_import_jsonl.py` | **Cloud Deploy** | Uploads Option 1 & Option 2 datasets to GCS, loads **native BigQuery tables**, creates & authorizes **BigQuery Authorized Views** (plus optional materialized export tables), and imports into cross-project Vertex AI Search datastores (including `html_native` Unstructured HTML + Layout Parser). |
 | `run_pipeline.py` | **Orchestrator** | In-process Cloud Run Job & local orchestrator supporting `--skip-crawl`, daily `recentchanges` short-circuit, and `>= 85%` drop-guard. |
 | `tests/test_pipeline.py` | **Tests** | Unit and dataset invariant test suite (`python3 -m unittest discover -s tests`). |
 

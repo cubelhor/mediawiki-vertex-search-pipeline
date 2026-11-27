@@ -37,7 +37,10 @@ COPY wiki_utils.py \
      3_chunk_pages.py \
      4_generate_vertex_jsonl.py \
      5_vertex_import_jsonl.py \
+     crawl_parse_html.py \
+     html_to_bq_chunks.py \
      run_pipeline.py \
+     run_parse_pipeline.py \
      /app/
 
 # Writable working data directory backed by Cloud Run in-memory tmpfs
@@ -45,4 +48,4 @@ RUN mkdir -p /app/wikimedia-data && chown -R appuser:appuser /app
 
 USER appuser
 
-ENTRYPOINT ["python", "/app/run_pipeline.py"]
+ENTRYPOINT ["python", "/app/run_parse_pipeline.py"]
